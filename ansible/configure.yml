@@ -1,0 +1,20 @@
+---
+- name: Configure Guardium host
+  hosts: all
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Set hostname
+      ansible.builtin.hostname:
+        name: "{{ hostvars[inventory_hostname].hostname | default(ansible_host) }}"
+
+    - name: Ensure host file entries exist
+      ansible.builtin.lineinfile:
+        path: /etc/hosts
+        regexp: "{{ ansible_host }}"
+        line: "{{ ansible_host }} {{ inventory_hostname }}"
+        create: true
+
+    - name: Print placeholder Guardium configuration step
+      ansible.builtin.debug:
+        msg: "Guardium configuration placeholder for {{ inventory_hostname }}; exact vendor role configuration should be validated against the target product release."

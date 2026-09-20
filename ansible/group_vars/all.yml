@@ -1,0 +1,20 @@
+guardium:
+  role: "{{ role | default('collector') }}"
+  domain: "example.com"
+  dns:
+    - "10.10.10.53"
+    - "10.10.10.54"
+  ntp:
+    - "pool.ntp.org"
+
+network:
+  gateway: "10.10.10.1"
+  prefix: 24
+
+collector:
+  hostname: "guardium-collector01.example.com"
+  ip: "10.10.10.10"
+
+aggregator:
+  hostname: "guardium-aggregator01.example.com"
+  ip: "10.10.10.20"

@@ -1,0 +1,19 @@
+collector:
+  vm_created: true
+  install_complete: false
+  role_validated: false
+  install_started: true
+  os_installed: false
+aggregator:
+  vm_created: true
+  install_complete: false
+  role_validated: false
+  install_started: true
+  os_installed: false
+registration:
+  collector_registered: false
+agents:
+  gim: false
+  stap: false
+database:
+  configured: false

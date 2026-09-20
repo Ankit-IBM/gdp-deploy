@@ -1,0 +1,27 @@
+---
+# Waits for a freshly installed Guardium appliance to become reachable over SSH,
+# then completes host configuration and validation.
+#
+# NOTE: The inspected Guardium 12.2 Kickstart files (std.ks/stdx.ks) do not set a
+# static IP; network addressing is completed through the vendor's NM_setup
+# first-boot wizard on the console. Run that step manually before this playbook
+# will succeed, unless DHCP already assigned the configured address.
+- name: Wait for Guardium appliance to become reachable
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: Wait for SSH port to open
+      ansible.builtin.wait_for:
+        host: "{{ ansible_host }}"
+        port: 22
+        timeout: "{{ converge_timeout_seconds | default(1800) }}"
+
+    - name: Wait for SSH authentication to succeed
+      ansible.builtin.wait_for_connection:
+        timeout: "{{ converge_timeout_seconds | default(1800) }}"
+
+- name: Complete Guardium host configuration
+  import_playbook: ../configure.yml
+
+- name: Validate Guardium host readiness
+  import_playbook: ../validate.yml

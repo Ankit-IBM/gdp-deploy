@@ -1,0 +1,322 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+CONFIG_FILE="${GUARDIUM_CONFIG:-$PROJECT_ROOT/config/lab.yml}"
+STATE_FILE="$PROJECT_ROOT/state/deployment.yml"
+LOG_DIR="$PROJECT_ROOT/logs"
+DEPLOY_LOG="$LOG_DIR/deployment.log"
+
+mkdir -p "$LOG_DIR" "$PROJECT_ROOT/state"
+touch "$DEPLOY_LOG"
+
+log() {
+  printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" | tee -a "$DEPLOY_LOG"
+}
+
+error() {
+  log "ERROR: $*"
+  return 1
+}
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || error "Required command is not installed: $1"
+}
+
+config_value() {
+  python3 - "$CONFIG_FILE" "$1" <<'PY'
+import sys
+try:
+    import yaml
+except ImportError:
+    raise SystemExit("PyYAML is required; activate the project virtual environment")
+with open(sys.argv[1], encoding="utf-8") as stream:
+    value = yaml.safe_load(stream) or {}
+for part in sys.argv[2].split('.'):
+    if not isinstance(value, dict) or part not in value:
+        value = ''
+        break
+    value = value[part]
+print('' if value is None else value)
+PY
+}
+
+state_set() {
+  python3 - "$STATE_FILE" "$1" "$2" <<'PY'
+import sys
+import yaml
+path, key, raw_value = sys.argv[1:]
+with open(path, encoding='utf-8') as stream:
+    data = yaml.safe_load(stream) or {}
+value = raw_value.lower() == 'true' if raw_value.lower() in {'true', 'false'} else raw_value
+cursor = data
+parts = key.split('.')
+for part in parts[:-1]:
+    cursor = cursor.setdefault(part, {})
+cursor[parts[-1]] = value
+with open(path, 'w', encoding='utf-8') as stream:
+    yaml.safe_dump(data, stream, sort_keys=False)
+PY
+}
+
+state_get() {
+  python3 - "$STATE_FILE" "$1" <<'PY'
+import sys
+import yaml
+path, key = sys.argv[1:]
+with open(path, encoding='utf-8') as stream:
+    data = yaml.safe_load(stream) or {}
+cursor = data
+for part in key.split('.'):
+    if not isinstance(cursor, dict) or part not in cursor:
+        cursor = ''
+        break
+    cursor = cursor[part]
+print('' if cursor is None else cursor)
+PY
+}
+
+select_iso() {
+  local configured
+  configured="$(config_value guardium.iso_path)"
+  if [[ -n "$configured" ]]; then
+    [[ -f "$configured" ]] || {
+      error "Configured Guardium ISO does not exist: $configured"
+      printf 'Available images:\n'
+      find /home/dev -maxdepth 1 -type f \( -iname '*.iso' -o -iname '*.img' \) -print | sed 's/^/  /'
+      return 1
+    }
+    printf '%s\n' "$configured"
+    return 0
+  fi
+
+  mapfile -t images < <(find /home/dev -maxdepth 1 -type f \( -iname '*.iso' -o -iname '*.img' \) -print | sort)
+  case "${#images[@]}" in
+    0) error "No Guardium ISO or IMG found under /home/dev"; return 1 ;;
+    1) printf '%s\n' "${images[0]}"; return 0 ;;
+  esac
+
+  printf 'Multiple installation images found:\n' >&2
+  local index=1
+  for image in "${images[@]}"; do
+    printf '  %d. %s\n' "$index" "$image" >&2
+    ((index += 1))
+  done
+  [[ -t 0 ]] || { error "Set guardium.iso_path explicitly when running non-interactively"; return 1; }
+  read -r -p 'Select image number: ' selection
+  [[ "$selection" =~ ^[0-9]+$ && "$selection" -ge 1 && "$selection" -le "${#images[@]}" ]] || { error "Invalid image selection"; return 1; }
+  printf '%s\n' "${images[$((selection - 1))]}"
+}
+
+validate_host() {
+  require_command virsh || return 1
+  require_command ip || return 1
+  require_command ovs-vsctl || return 1
+  sudo -n virsh version >/dev/null 2>&1 || { error "libvirt is not reachable through qemu:///system (requires passwordless sudo)"; return 1; }
+
+  local bridge
+  bridge="$(config_value network.ovs_bridge)"
+  [[ -n "$bridge" ]] || {
+    error "network.ovs_bridge is empty; configure an existing OVS bridge in $CONFIG_FILE"
+    printf 'Detected links:\n'; ip -brief link || true
+    printf 'Detected OVS bridges (requires permission to query OVS):\n'; sudo -n ovs-vsctl list-br 2>&1 | sed 's/^/  /' || true
+    return 1
+  }
+  sudo -n ovs-vsctl br-exists "$bridge" 2>/dev/null || {
+    error "OVS bridge '$bridge' does not exist or cannot be queried"
+    printf 'Detected OVS bridges:\n'; sudo -n ovs-vsctl list-br 2>&1 | sed 's/^/  /' || true
+    return 1
+  }
+  log "Validated existing OVS bridge: $bridge"
+}
+
+update_deploy_flags() {
+  local role="$1"
+  local flags_file="$PROJECT_ROOT/terraform/deploy-flags.auto.tfvars.json"
+  python3 - "$flags_file" "$role" <<'PY'
+import json
+import os
+import sys
+path, role = sys.argv[1:]
+flags = {"deploy_collector": False, "deploy_aggregator": False}
+if os.path.exists(path):
+    with open(path, encoding="utf-8") as stream:
+        flags.update(json.load(stream))
+if role in ("collector", "full"):
+    flags["deploy_collector"] = True
+if role in ("aggregator", "full"):
+    flags["deploy_aggregator"] = True
+with open(path, "w", encoding="utf-8") as stream:
+    json.dump(flags, stream, indent=2)
+    stream.write("\n")
+PY
+}
+
+terraform_apply() {
+  local role="$1" iso="$2"
+  case "$role" in
+    collector|aggregator|full) ;;
+    *) error "Unsupported infrastructure role: $role"; return 1 ;;
+  esac
+  local iac_binary
+  iac_binary="$(command -v terraform || command -v tofu || true)"
+  [[ -n "$iac_binary" ]] || {
+    error "Install Terraform or OpenTofu before provisioning"
+    return 1
+  }
+  local bridge pool
+  bridge="$(config_value network.ovs_bridge)"
+  pool="$(config_value kvm.storage_pool)"
+  sudo -n "$iac_binary" -chdir="$PROJECT_ROOT/terraform" init
+  sudo -n "$iac_binary" -chdir="$PROJECT_ROOT/terraform" validate
+
+  # Deploy flags are additive and persisted: once a role's VM has been requested,
+  # a later single-role run must never flip it back to false and destroy it.
+  update_deploy_flags "$role"
+
+  # Both roles' variables are always passed on every apply (regardless of which
+  # role was requested this run) so that an unrelated single-role invocation can
+  # never revert the other role's attributes to their Terraform defaults, which
+  # would force an unwanted replace/destroy of an already-deployed VM.
+  local args=(
+    -auto-approve
+    -var "iso_path=$iso" -var "network_bridge=$bridge" -var "storage_pool=$pool"
+    -var "collector_name=$(config_value collector.hostname)"
+    -var "collector_hostname=$(config_value collector.hostname)"
+    -var "collector_ip=$(config_value collector.ip)"
+    -var "collector_cpu=$(config_value collector.cpu)"
+    -var "collector_memory_mb=$(( $(config_value collector.memory_gb) * 1024 ))"
+    -var "collector_disk_gb=$(config_value collector.disk_gb)"
+    -var "aggregator_name=$(config_value aggregator.hostname)"
+    -var "aggregator_hostname=$(config_value aggregator.hostname)"
+    -var "aggregator_ip=$(config_value aggregator.ip)"
+    -var "aggregator_cpu=$(config_value aggregator.cpu)"
+    -var "aggregator_memory_mb=$(( $(config_value aggregator.memory_gb) * 1024 ))"
+    -var "aggregator_disk_gb=$(config_value aggregator.disk_gb)"
+  )
+  sudo -n "$iac_binary" -chdir="$PROJECT_ROOT/terraform" apply "${args[@]}"
+}
+
+# Guardium 12.2 isolinux menu order (verified against the mounted ISO):
+#   1. std        -> Standard installation (non CM) NM_setup      [Collector]
+#   2. nodiskx     -> Custom Partition installation (Graphical Mode)
+#   3. agg         -> Aggregator or Central Manager (CM) NM_setup [Aggregator]
+#   4. nodiskxagg  -> Custom Partitioned Aggregator or Central Manager (CM)
+# The menu defaults to entry 1, so Collector needs 0 Down presses and
+# Aggregator needs 2 Down presses before Enter.
+select_boot_entry() {
+  local role="$1" name downs=0
+  name="$(config_value "$role.hostname")"
+  [[ "$role" == aggregator ]] && downs=2
+
+  local waited=0
+  while [[ "$(sudo -n virsh domstate "$name" 2>/dev/null)" != "running" ]]; do
+    sleep 1
+    waited=$((waited + 1))
+    [[ "$waited" -ge 30 ]] && { error "Timed out waiting for $name to start"; return 1; }
+  done
+  sleep 4
+
+  local i
+  for ((i = 0; i < downs; i++)); do
+    sudo -n virsh send-key "$name" --codeset linux --holdtime 150 108
+    sleep 1
+  done
+  sudo -n virsh send-key "$name" --codeset linux --holdtime 200 28
+
+  mkdir -p "$LOG_DIR"
+  sleep 3
+  sudo -n virsh screenshot "$name" "$LOG_DIR/${role}-install-start.png" --screen 0 >/dev/null 2>&1 || true
+  log "Selected installer menu entry for $role (Down x$downs, Enter); screenshot: logs/${role}-install-start.png"
+}
+
+maybe_select_boot_entry() {
+  local role="$1"
+  [[ "$(state_get "$role.install_started")" == True ]] && return 0
+  select_boot_entry "$role" || return 1
+  state_set "$role.install_started" true
+}
+
+provision() {
+  local role="$1" iso
+  validate_host || return 1
+  iso="$(select_iso)" || return 1
+  log "Using Guardium installation image: $iso"
+  terraform_apply "$role" "$iso" || return 1
+  [[ "$role" == aggregator ]] && state_set aggregator.vm_created true || true
+  [[ "$role" == collector ]] && state_set collector.vm_created true || true
+  [[ "$role" == full ]] && state_set collector.vm_created true && state_set aggregator.vm_created true || true
+
+  case "$role" in
+    collector) maybe_select_boot_entry collector || return 1 ;;
+    aggregator) maybe_select_boot_entry aggregator || return 1 ;;
+    full)
+      maybe_select_boot_entry collector || return 1
+      maybe_select_boot_entry aggregator || return 1
+      ;;
+  esac
+  log "Infrastructure stage completed. Guardium OS installation is proceeding in the guest; run './scripts/guardium-deploy converge <role>' once network access is available."
+}
+
+converge() {
+  local role="$1" ip timeout
+  [[ "$role" == collector || "$role" == aggregator ]] || { error "Unsupported role for converge: $role"; return 1; }
+  require_command ansible-playbook || return 1
+  ip="$(config_value "$role.ip")"
+  [[ -n "$ip" ]] || { error "$role.ip is not set in $CONFIG_FILE"; return 1; }
+  timeout="$(config_value guardium.install_timeout_minutes)"
+  timeout="${timeout:-30}"
+  log "Waiting for $role ($ip) to become reachable and completing configuration"
+  ansible-playbook -i "${ip}," "$PROJECT_ROOT/ansible/playbooks/wait-for-guardium.yml" \
+    --extra-vars "ansible_host=$ip role=$role" \
+    --extra-vars "converge_timeout_seconds=$((timeout * 60))" || return 1
+  state_set "$role.install_complete" true
+  log "$role configuration and validation completed"
+}
+
+validate() {
+  validate_host || return 1
+  require_command virsh || return 1
+  virsh list --all
+  log "Infrastructure validation completed; appliance/API validation requires configured Guardium access."
+}
+
+status() {
+  cat "$STATE_FILE"
+}
+
+destroy() {
+  [[ "${GUARDIUM_ALLOW_DESTROY:-}" == yes ]] || {
+    error "Destruction is disabled. Set GUARDIUM_ALLOW_DESTROY=yes and rerun to request Terraform destroy."
+    return 1
+  }
+  printf 'This will destroy only resources managed by this Terraform state. Type DESTROY to continue: '
+  read -r confirmation
+  [[ "$confirmation" == DESTROY ]] || { log "Destroy cancelled"; return 0; }
+  local iac_binary
+  iac_binary="$(command -v terraform || command -v tofu || true)"
+  [[ -n "$iac_binary" ]] || { error "Install Terraform or OpenTofu before destruction"; return 1; }
+  sudo -n "$iac_binary" -chdir="$PROJECT_ROOT/terraform" destroy -auto-approve
+}
+
+interactive_menu() {
+  printf '\nIBM Guardium Deployment Automation\n\n'
+  printf '1. Setup Collector\n2. Setup Aggregator\n3. Register Collector to Aggregator\n4. Configure Agents\n5. Configure Database\n6. Setup Central Manager\n7. Validate Environment\n8. Full Deployment\n9. Resume Deployment\n10. Show Status\n11. Destroy Guardium Lab\n12. Exit\n\n'
+  read -r -p 'Select an option: ' option
+  case "$option" in
+    1) provision collector ;; 2) provision aggregator ;; 7) validate ;; 8) provision full ;; 10) status ;; 11) destroy ;; 12) return 0 ;;
+    3|4|5|6|9) error "This release-specific workflow is scaffolded but not enabled until its supported Guardium mechanism is verified" ;;
+    *) error "Invalid selection" ;;
+  esac
+}
+
+case "${1:-menu}" in
+  collector|aggregator|full) provision "$1" ;;
+  converge) converge "${2:-}" ;;
+  validate) validate ;;
+  status) status ;;
+  destroy) destroy ;;
+  register|agents|database|central-manager|resume) error "This release-specific workflow is scaffolded but not enabled until its supported Guardium mechanism is verified" ;;
+  menu) interactive_menu ;;
+  *) printf 'Usage: %s {collector|aggregator|register|agents|database|central-manager|converge <role>|validate|full|resume|status|destroy}\n' "$0" >&2; exit 2 ;;
+esac

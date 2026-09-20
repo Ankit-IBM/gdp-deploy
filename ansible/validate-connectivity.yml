@@ -1,0 +1,21 @@
+---
+- name: Validate Collector and Aggregator connectivity
+  hosts: all
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Validate DNS resolution to peer
+      ansible.builtin.command: "getent hosts {{ hostvars['aggregator'].ansible_host if inventory_hostname == 'collector' else hostvars['collector'].ansible_host }}"
+      register: dns_check
+      changed_when: false
+      failed_when: dns_check.rc != 0
+
+    - name: Validate TCP to peer port 443
+      ansible.builtin.wait_for:
+        host: "{{ hostvars['aggregator'].ansible_host if inventory_hostname == 'collector' else hostvars['collector'].ansible_host }}"
+        port: 443
+        timeout: 15
+
+    - name: Print validation result
+      ansible.builtin.debug:
+        msg: "Peer connectivity validated from {{ inventory_hostname }}."

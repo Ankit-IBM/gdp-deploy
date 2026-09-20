@@ -1,0 +1,41 @@
+project:
+  name: guardium-lab
+
+guardium:
+  version: "12.2"
+  iso_path: "/home/dev/Security_Guardium_Product_Image_V12_2_ISO_with_12.2.2.iso"
+
+kvm:
+  storage_pool: default
+
+network:
+  type: ovs
+  ovs_bridge: ovs-br0
+
+collector:
+  enabled: true
+  hostname: gdp-col01
+  ip: 10.50.20.31
+  cpu: 4
+  memory_gb: 16
+  disk_gb: 300
+
+aggregator:
+  enabled: true
+  hostname: gdp-agg01
+  ip: 10.50.20.21
+  cpu: 4
+  memory_gb: 16
+  disk_gb: 300
+
+central_manager:
+  enabled: false
+  hostname: gdp-cm01
+  ip: 10.50.10.20
+  cpu: 4
+  memory_gb: 16
+  disk_gb: 300
+
+agents:
+  gim: true
+  stap: true

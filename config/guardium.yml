@@ -1,0 +1,47 @@
+guardium:
+  iso_directory: "/home/dev"
+  iso_pattern: "*.iso"
+  iso_file: "/home/dev/Security_Guardium_Product_Image_V12_2_ISO_with_12.2.2.iso"
+  installer_mode: "kickstart"
+  install_timeout_minutes: 90
+  validation_timeout_minutes: 15
+
+collector:
+  hostname: "guardium-collector01.example.com"
+  ip: "10.10.10.10"
+  prefix: 24
+  gateway: "10.10.10.1"
+  dns:
+    - "10.10.10.53"
+    - "10.10.10.54"
+  domain: "example.com"
+  role: "collector"
+
+aggregator:
+  hostname: "guardium-aggregator01.example.com"
+  ip: "10.10.10.20"
+  prefix: 24
+  gateway: "10.10.10.1"
+  dns:
+    - "10.10.10.53"
+    - "10.10.10.54"
+  domain: "example.com"
+  role: "aggregator"
+
+network:
+  type: "ovs"
+  bridge: "ovs-br0"
+  vlan: null
+
+vm:
+  collector:
+    name: "guardium-collector"
+    cpu: 8
+    memory_mb: 32768
+    disk_gb: 500
+
+  aggregator:
+    name: "guardium-aggregator"
+    cpu: 8
+    memory_mb: 32768
+    disk_gb: 500

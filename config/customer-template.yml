@@ -1,0 +1,46 @@
+project:
+  name: customer-guardium
+
+guardium:
+  version: "12.x"
+  iso_path: ""
+
+kvm:
+  storage_pool: default
+
+network:
+  type: ovs
+  ovs_bridge: ""
+
+credentials:
+  source: environment
+  guardium_username: "${GUARDIUM_USERNAME}"
+  guardium_password: "${GUARDIUM_PASSWORD}"
+
+collector:
+  enabled: true
+  hostname: gdp-col01.example.invalid
+  ip: 192.0.2.31
+  cpu: 4
+  memory_gb: 16
+  disk_gb: 300
+
+aggregator:
+  enabled: true
+  hostname: gdp-agg01.example.invalid
+  ip: 192.0.2.21
+  cpu: 4
+  memory_gb: 16
+  disk_gb: 300
+
+central_manager:
+  enabled: false
+  hostname: gdp-cm01.example.invalid
+  ip: 192.0.2.20
+  cpu: 4
+  memory_gb: 16
+  disk_gb: 300
+
+agents:
+  gim: false
+  stap: false

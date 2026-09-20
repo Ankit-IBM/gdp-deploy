@@ -1,0 +1,4 @@
+---
+- name: Guardium placeholder task
+  ansible.builtin.debug:
+    msg: "Guardium role configuration placeholder; exact vendor command set must be confirmed against the target appliance image."

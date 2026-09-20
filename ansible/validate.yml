@@ -1,0 +1,12 @@
+---
+- name: Validate Guardium host readiness
+  hosts: all
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Ensure host is reachable
+      ansible.builtin.ping:
+
+    - name: Print readiness status
+      ansible.builtin.debug:
+        msg: "Guardium host {{ inventory_hostname }} is reachable and ready for role validation."
