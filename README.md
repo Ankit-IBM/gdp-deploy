@@ -17,6 +17,7 @@ guardium-deployment/
 │   └── guardium.yml                # default appliance sizing
 ├── scripts/
 │   ├── guardium-deploy             # main CLI (all commands)
+│   ├── list-images.py              # interactive image picker (AWS/GCP/Azure/vSphere)
 │   ├── guardium-everything.sh      # one-shot full automation helper
 │   └── deploy-guardium.sh          # legacy alias → guardium-deploy
 ├── terraform/
@@ -80,18 +81,43 @@ pip install ansible PyYAML paramiko pywinrm requests
 
 Set `cloud.provider` in your config (or pass `-var cloud_provider=<value>`):
 
+### Image / ISO selection
+
+Before deploying to a cloud platform, use `scripts/list-images.py` to list available
+Guardium images on the target platform and select the one to deploy:
+
+```bash
+python3 scripts/list-images.py aws     --region us-east-1
+python3 scripts/list-images.py gcp     --project my-gcp-project
+python3 scripts/list-images.py azure   --subscription <id> --resource-group rg-guardium
+python3 scripts/list-images.py vsphere --server vcenter.example.com --datastore datastore1
+```
+
+When using `./scripts/guardium-deploy full`, the picker runs automatically and
+prompts you to select the image before Terraform is invoked.
+
 | Provider | Value | Prerequisites |
 |---|---|---|
 | KVM/libvirt (lab) | `kvm` | virsh, OVS bridge, ISO on disk |
-| VMware vCenter | `vsphere` | vSphere 7+, OVA in Content Library |
+| VMware vCenter | `vsphere` | vSphere 7+, Guardium ISO uploaded to Datastore |
 | Google Cloud | `gcp` | Custom image from Guardium ISO, VPC subnet |
 | AWS | `aws` | AMI imported via VM Import/Export, VPC subnet |
 | Azure | `azure` | Managed image from Guardium VHD, VNet subnet |
 
 ### vSphere
+
+Upload the Guardium ISO to your datastore first (via vSphere Client or govc), then deploy:
+
 ```bash
 export VSPHERE_USER="administrator@vsphere.local"
 export VSPHERE_PASSWORD="secret"
+export VSPHERE_SERVER="vcenter.example.com"
+
+# List ISOs on the datastore and select one interactively:
+python3 scripts/list-images.py vsphere \
+  --server vcenter.example.com --datastore datastore1
+
+# Deploy (image picker runs automatically on ./scripts/guardium-deploy full):
 terraform -chdir=terraform apply \
   -var cloud_provider=vsphere \
   -var vsphere_server=vcenter.example.com \
@@ -99,8 +125,7 @@ terraform -chdir=terraform apply \
   -var vsphere_cluster=Cluster1 \
   -var vsphere_datastore=datastore1 \
   -var vsphere_network="VM Network" \
-  -var vsphere_content_library=guardium-lib \
-  -var vsphere_content_library_item=guardium-12.2 \
+  -var "vsphere_iso_datastore_path=guardium/Security_Guardium_Product_Image_V12_2.iso" \
   -var collector_ip=10.50.20.31 \
   -var aggregator_ip=10.50.20.21
 ```

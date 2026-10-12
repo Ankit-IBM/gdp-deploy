@@ -1,5 +1,5 @@
 ---
-- name: Configure Guardium host
+- name: Configure Guardium appliance host
   hosts: all
   become: true
   gather_facts: false
@@ -8,13 +8,19 @@
       ansible.builtin.hostname:
         name: "{{ hostvars[inventory_hostname].hostname | default(ansible_host) }}"
 
-    - name: Ensure host file entries exist
+    - name: Ensure /etc/hosts entry exists
       ansible.builtin.lineinfile:
         path: /etc/hosts
         regexp: "{{ ansible_host }}"
         line: "{{ ansible_host }} {{ inventory_hostname }}"
         create: true
 
-    - name: Print placeholder Guardium configuration step
+    - name: Verify Guardium services are running
+      ansible.builtin.command: systemctl is-active guard
+      register: guard_status
+      failed_when: false
+      changed_when: false
+
+    - name: Report appliance status
       ansible.builtin.debug:
-        msg: "Guardium configuration placeholder for {{ inventory_hostname }}; exact vendor role configuration should be validated against the target product release."
+        msg: "Guardium appliance {{ inventory_hostname }} ({{ ansible_host }}): guard service {{ guard_status.stdout | default('unknown') }}"

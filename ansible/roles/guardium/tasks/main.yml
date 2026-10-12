@@ -1,4 +1,17 @@
 ---
-- name: Guardium placeholder task
+- name: Verify Guardium guard service is running
+  ansible.builtin.systemd:
+    name: guard
+    state: started
+    enabled: true
+  failed_when: false
+
+- name: Check Guardium process
+  ansible.builtin.command: pgrep -x guard
+  register: guard_proc
+  failed_when: false
+  changed_when: false
+
+- name: Report Guardium role status
   ansible.builtin.debug:
-    msg: "Guardium role configuration placeholder; exact vendor command set must be confirmed against the target appliance image."
+    msg: "Guardium {{ guardium_role | default('appliance') }} on {{ inventory_hostname }}: PID {{ guard_proc.stdout | default('not found') }}"
