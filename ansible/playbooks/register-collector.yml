@@ -1,0 +1,45 @@
+---
+# Register a Guardium Collector with its Aggregator via REST API.
+# Run after both appliances are installed and network-reachable.
+#
+# Required --extra-vars:
+#   collector_url, collector_username, collector_password
+#   aggregator_ip, aggregator_username, aggregator_password
+
+- name: Register Collector to Aggregator
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Run collector → aggregator registration
+      ansible.builtin.command:
+        cmd: >
+          {{ playbook_dir }}/../../.venv/bin/python3 -c "
+          import logging, sys
+          logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
+          sys.path.insert(0, '{{ playbook_dir }}/../..')
+          from guardapi.registration import register_collector_to_aggregator, verify_registration
+          register_collector_to_aggregator(
+              collector_url='{{ collector_url }}',
+              collector_username='{{ collector_username }}',
+              collector_password='{{ collector_password }}',
+              aggregator_ip='{{ aggregator_ip }}',
+              aggregator_username='{{ aggregator_username }}',
+              aggregator_password='{{ aggregator_password }}',
+              verify_tls=False,
+          )
+          col_ip = '{{ collector_url }}'.replace('https://','').replace('http://','').split(':')[0]
+          ok = verify_registration(
+              aggregator_url='https://{{ aggregator_ip }}:8443',
+              aggregator_username='{{ aggregator_username }}',
+              aggregator_password='{{ aggregator_password }}',
+              collector_ip=col_ip,
+              verify_tls=False,
+          )
+          print('REGISTRATION_VERIFIED' if ok else 'REGISTRATION_UNCONFIRMED')
+          "
+      register: reg_out
+      changed_when: "'REGISTRATION_VERIFIED' in reg_out.stdout"
+
+    - name: Show result
+      ansible.builtin.debug:
+        msg: "{{ reg_out.stdout_lines }}"

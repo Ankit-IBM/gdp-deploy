@@ -1,0 +1,63 @@
+---
+# Install S-TAP on Linux/Unix DB servers via SSH.
+# Inventory group: [stap_linux]
+# Required --extra-vars: guardium_collector_ip
+# Optional: guardium_version, db_type, stap_rpm_path, dry_run
+
+- name: Install S-TAP on Linux DB servers via SSH
+  hosts: stap_linux
+  gather_facts: false
+  serial: 5
+  vars:
+    guardium_version: "12.2"
+    db_type: "all"
+    dry_run: false
+
+  tasks:
+    - name: Install S-TAP RPM and configure guard.conf
+      ansible.builtin.shell: |
+        set -e
+        RPM_DEST="/tmp/guard-stap-{{ guardium_version }}.rpm"
+
+        {% if stap_rpm_path is defined and stap_rpm_path %}
+        # RPM staged by copy task below — already at $RPM_DEST
+        true
+        {% else %}
+        # Fetch directly from the Guardium appliance
+        scp -o StrictHostKeyChecking=no -P 16022 \
+          cli@{{ guardium_collector_ip }}:/var/IBM/Guardium/stap/guard-stap-{{ guardium_version }}-linux-x86-64.rpm \
+          "$RPM_DEST"
+        {% endif %}
+
+        rpm -Uvh "$RPM_DEST"
+        printf 'TAP_IP={{ guardium_collector_ip }}\nGUARD_PORT=8075\nDB_TYPE={{ db_type }}\nINSPECTION_ENGINE_COUNT=1\nSTAP_ENABLED=1\n' \
+          > /etc/sysconfig/guard.conf
+        systemctl enable guard-stap && systemctl restart guard-stap || service guard-stap restart
+      when: not (dry_run | bool)
+      register: stap_result
+
+    - name: Copy S-TAP RPM to host (when stap_rpm_path provided)
+      ansible.builtin.copy:
+        src: "{{ stap_rpm_path }}"
+        dest: "/tmp/guard-stap-{{ guardium_version }}.rpm"
+        mode: "0644"
+      when:
+        - stap_rpm_path is defined
+        - stap_rpm_path | length > 0
+        - not (dry_run | bool)
+
+    - name: Dry-run notice
+      ansible.builtin.debug:
+        msg: "[DRY-RUN] Would install S-TAP {{ guardium_version }} on {{ inventory_hostname }}, collector={{ guardium_collector_ip }}"
+      when: dry_run | bool
+
+    - name: Verify S-TAP service is active
+      ansible.builtin.command: systemctl is-active guard-stap
+      register: stap_svc
+      failed_when: stap_svc.rc != 0
+      changed_when: false
+      when: not (dry_run | bool)
+
+    - name: Show service status
+      ansible.builtin.debug:
+        msg: "guard-stap on {{ inventory_hostname }}: {{ stap_svc.stdout | default('dry-run') }}"

@@ -1,112 +1,264 @@
 # IBM Guardium Deployment Automation
 
-This repository is a conservative foundation for deploying Guardium VMs on an existing Rocky Linux KVM/libvirt host. It does not install or reconfigure Rocky Linux, KVM, libvirt, Open vSwitch, or unrelated workloads.
+End-to-end lifecycle automation for IBM Guardium Data Protection 12.x:
+VM provisioning (on-prem KVM, VMware vSphere/vCenter, GCP, AWS, Azure),
+Collector → Aggregator registration, sample policy deployment, and S-TAP
+agent installation via SSH, WinRM, or GIM (Guardium Installation Manager).
 
-## Verified host
+---
 
-The inspected host is Rocky Linux 9.8 with libvirt/QEMU available. The discovered installation image is `/home/dev/Security_Guardium_Product_Image_V12_2_ISO_with_12.2.2.iso`. The existing OVS bridge is `ovs-br0` (configured in `config/lab.yml`).
+## Directory layout
 
-Both the Collector and Aggregator VMs have been provisioned and successfully completed the Guardium 12.2 OS installation (RHEL 9.6 base, `guardium-base*` packages). Key fixes required to get a working install, documented in [repo memory](../../.), include CPU `host-passthrough`, separating the OS disk (SATA) from the installer ISO (IDE), and booting `hd` before `cdrom`.
+```
+guardium-deployment/
+├── config/
+│   ├── lab.yml                     # active lab config
+│   ├── customer-template.yml       # template for customer deployments
+│   └── guardium.yml                # default appliance sizing
+├── scripts/
+│   ├── guardium-deploy             # main CLI (all commands)
+│   ├── guardium-everything.sh      # one-shot full automation helper
+│   └── deploy-guardium.sh          # legacy alias → guardium-deploy
+├── terraform/
+│   ├── main.tf                     # KVM/libvirt modules (lab)
+│   ├── cloud.tf                    # multi-cloud dispatch (vsphere/gcp/aws/azure)
+│   ├── providers.tf                # all provider declarations
+│   ├── variables.tf                # core variables
+│   ├── cloud_variables.tf          # cloud-provider variables
+│   └── modules/
+│       ├── guardium-vm/            # KVM/libvirt module
+│       ├── guardium-vsphere/       # VMware vSphere module
+│       ├── guardium-gcp/           # Google Cloud module
+│       ├── guardium-aws/           # AWS module
+│       └── guardium-azure/         # Azure module
+├── ansible/
+│   ├── inventory/hosts.yml         # appliances + stap_linux + stap_windows
+│   ├── group_vars/all.yml
+│   ├── playbooks/
+│   │   ├── wait-for-guardium.yml   # wait for SSH + converge
+│   │   ├── register-collector.yml  # collector → aggregator registration
+│   │   ├── deploy-policies.yml     # sample policy deployment
+│   │   ├── install-stap-ssh.yml    # S-TAP via SSH (Linux)
+│   │   ├── install-stap-winrm.yml  # S-TAP via WinRM (Windows)
+│   │   └── install-stap-gim.yml    # S-TAP via GIM
+│   └── roles/guardium/
+├── guardapi/                       # Python REST API library
+│   ├── client.py                   # HTTPS client
+│   ├── registration.py             # collector→aggregator registration
+│   ├── policies.py                 # sample policy deploy
+│   └── stap.py                     # SSH / WinRM / GIM dispatcher
+└── state/deployment.yml            # deployment state (no secrets)
+```
 
-**All `virsh` and Terraform/OpenTofu invocations require passwordless `sudo`** on this host; without it, the libvirt provider intermittently fails with a polkit authorization timeout. Configure this once with:
+---
+
+## Quick start — full deployment
 
 ```bash
-sudo tee /etc/sudoers.d/guardium-deploy >/dev/null <<'EOF'
-dev ALL=(root) NOPASSWD: ALL
-EOF
-sudo chmod 440 /etc/sudoers.d/guardium-deploy
-sudo visudo -cf /etc/sudoers.d/guardium-deploy
+cd /root/guardium-deployment
+python3 -m venv .venv && source .venv/bin/activate
+pip install ansible PyYAML paramiko pywinrm requests
+
+# Edit config/lab.yml with your IPs, bridge name, and ISO path.
+
+# Interactive menu — walks you through every step:
+./scripts/guardium-deploy menu
+
+# Or run each phase individually:
+./scripts/guardium-deploy collector              # provision Collector VM
+./scripts/guardium-deploy aggregator             # provision Aggregator VM
+./scripts/guardium-deploy converge collector     # wait + configure Collector
+./scripts/guardium-deploy converge aggregator    # wait + configure Aggregator
+./scripts/guardium-deploy register               # register Collector → Aggregator
+./scripts/guardium-deploy policies               # deploy sample policies
+./scripts/guardium-deploy stap                   # install S-TAP (prompts for method)
 ```
 
-## Known limitation: first-boot networking
+---
 
-The Guardium Kickstart does not configure a static IP or hostname. After installation, both appliances boot to `localhost login:` with no network reachable. IBM's own **NM_setup** wizard (interactive console, vendor/customer root credentials) must be completed manually before `./scripts/guardium-deploy converge <role>` can reach the host over SSH. This automation does not attempt to guess or bypass that credential.
+## Multi-cloud deployment
 
-## Configuration
+Set `cloud.provider` in your config (or pass `-var cloud_provider=<value>`):
 
-Edit [config/lab.yml](config/lab.yml). The ISO path and OVS bridge are intentionally explicit:
+| Provider | Value | Prerequisites |
+|---|---|---|
+| KVM/libvirt (lab) | `kvm` | virsh, OVS bridge, ISO on disk |
+| VMware vCenter | `vsphere` | vSphere 7+, OVA in Content Library |
+| Google Cloud | `gcp` | Custom image from Guardium ISO, VPC subnet |
+| AWS | `aws` | AMI imported via VM Import/Export, VPC subnet |
+| Azure | `azure` | Managed image from Guardium VHD, VNet subnet |
 
-```yaml
-guardium:
-  iso_path: /home/dev/Security_Guardium_Product_Image_V12_2_ISO_with_12.2.2.iso
-network:
-  ovs_bridge: ovs-br0
+### vSphere
+```bash
+export VSPHERE_USER="administrator@vsphere.local"
+export VSPHERE_PASSWORD="secret"
+terraform -chdir=terraform apply \
+  -var cloud_provider=vsphere \
+  -var vsphere_server=vcenter.example.com \
+  -var vsphere_datacenter=DC1 \
+  -var vsphere_cluster=Cluster1 \
+  -var vsphere_datastore=datastore1 \
+  -var vsphere_network="VM Network" \
+  -var vsphere_content_library=guardium-lib \
+  -var vsphere_content_library_item=guardium-12.2 \
+  -var collector_ip=10.50.20.31 \
+  -var aggregator_ip=10.50.20.21
 ```
 
-The host must also allow passwordless sudo for libvirt automation; otherwise validation fails with a `qemu:///system` authorization error:
+### AWS
+```bash
+export AWS_ACCESS_KEY_ID="..."
+export AWS_SECRET_ACCESS_KEY="..."
+terraform -chdir=terraform apply \
+  -var cloud_provider=aws \
+  -var aws_region=us-east-1 \
+  -var aws_guardium_ami_id=ami-0123456789abcdef0 \
+  -var aws_subnet_id=subnet-abc12345 \
+  -var 'aws_security_group_ids=["sg-abc12345"]' \
+  -var collector_ip=10.50.20.31 \
+  -var aggregator_ip=10.50.20.21
+```
+
+### GCP
+```bash
+export GOOGLE_APPLICATION_CREDENTIALS="/path/to/key.json"
+terraform -chdir=terraform apply \
+  -var cloud_provider=gcp \
+  -var gcp_project_id=my-project \
+  -var gcp_region=us-central1 \
+  -var gcp_zone=us-central1-a \
+  -var gcp_subnetwork=projects/my-project/regions/us-central1/subnetworks/default \
+  -var gcp_guardium_image=projects/my-project/global/images/guardium-12-2 \
+  -var collector_ip=10.50.20.31 \
+  -var aggregator_ip=10.50.20.21
+```
+
+### Azure
+```bash
+export ARM_CLIENT_ID="..." ARM_CLIENT_SECRET="..." ARM_TENANT_ID="..."
+terraform -chdir=terraform apply \
+  -var cloud_provider=azure \
+  -var azure_subscription_id=<sub-id> \
+  -var azure_resource_group=rg-guardium \
+  -var azure_location=eastus \
+  -var azure_guardium_image_id=/subscriptions/.../guardium-12-2 \
+  -var azure_subnet_id=/subscriptions/.../subnets/guardium \
+  -var azure_admin_ssh_public_key="ssh-rsa AAAA..." \
+  -var collector_ip=10.50.20.31 \
+  -var aggregator_ip=10.50.20.21
+```
+
+---
+
+## Registration (Collector → Aggregator)
 
 ```bash
-sudo tee /etc/sudoers.d/guardium-deploy >/dev/null <<'EOF'
-dev ALL=(root) NOPASSWD: ALL
-EOF
-sudo chmod 440 /etc/sudoers.d/guardium-deploy
-sudo visudo -cf /etc/sudoers.d/guardium-deploy
+export GUARDIUM_COLLECTOR_PASSWORD="admin-pass"
+export GUARDIUM_AGGREGATOR_PASSWORD="admin-pass"
+./scripts/guardium-deploy register
+
+# Or directly via Ansible:
+ansible-playbook ansible/playbooks/register-collector.yml \
+  -e collector_url=https://10.50.20.31:8443 \
+  -e collector_username=admin \
+  -e collector_password=secret \
+  -e aggregator_ip=10.50.20.21 \
+  -e aggregator_username=admin \
+  -e aggregator_password=secret
 ```
 
-Use [config/customer-template.yml](config/customer-template.yml) for customer-specific values. It contains no credentials. Credentials are expected through a secret store, Ansible Vault, or environment variables.
+---
 
-## Commands
+## Sample policy deployment
 
-### Deploy
+Deploys four baseline policies: `BASELINE_AUDIT`, `PCI_DSS_AUDIT`, `HIPAA_AUDIT`, `EXTRUSION_DETECT`.
 
 ```bash
-cd /home/dev/guard
-source .venv/bin/activate
+export GUARDIUM_COLLECTOR_PASSWORD="admin-pass"
+./scripts/guardium-deploy policies
 
-./scripts/guardium-deploy status
-./scripts/guardium-deploy validate
-./scripts/guardium-deploy collector
-./scripts/guardium-deploy aggregator
-./scripts/guardium-deploy full
-./scripts/guardium-deploy converge collector   # waits for SSH, then configures/validates
-./scripts/guardium-deploy converge aggregator
-./scripts/guardium-deploy resume
+# Or directly:
+python3 -m guardapi.policies \
+  --url https://10.50.20.31:8443 \
+  --username admin --password secret
 ```
 
-### One-shot deployment helper
+---
 
+## S-TAP / GIM installation
+
+### Interactive (prompts for method + confirms automation)
 ```bash
-cd /home/dev/guard
-./scripts/guardium-everything.sh full
-./scripts/guardium-everything.sh collector
-./scripts/guardium-everything.sh aggregator
+./scripts/guardium-deploy stap
 ```
+If you answer **`n`** at the confirmation prompt, the script prints exact
+manual one-liner commands you can run yourself — nothing is installed.
 
-### Destroy / tear down the environment
-
-To destroy the full lab environment, use the explicit approval guard and type `DESTROY` when prompted:
-
+### SSH (Linux/Unix DB server)
 ```bash
-cd /home/dev/guard
-GUARDIUM_ALLOW_DESTROY=yes ./scripts/guardium-deploy destroy
+# Automated:
+ansible-playbook -i ansible/inventory/hosts.yml \
+  ansible/playbooks/install-stap-ssh.yml \
+  -e guardium_collector_ip=10.50.20.31
+
+# Manual one-liner (printed when you say no, or run directly):
+python3 -m guardapi.stap manual --method ssh \
+  --host 10.1.2.10 --guardium-ip 10.50.20.31
 ```
 
-This is the full-environment teardown command. It removes the Terraform-managed VM infrastructure and requires the interactive `DESTROY` confirmation.
+### WinRM (Windows DB server)
+```bash
+# Automated:
+ansible-playbook -i ansible/inventory/hosts.yml \
+  ansible/playbooks/install-stap-winrm.yml \
+  -e guardium_collector_ip=10.50.20.31 \
+  -e stap_msi_path=/path/to/guard-stap.msi
 
-If you want to destroy only the currently managed state without the prompt, this is not allowed by design; the script intentionally blocks it unless `GUARDIUM_ALLOW_DESTROY=yes` is set.
+# Manual one-liner:
+python3 -m guardapi.stap manual --method winrm \
+  --host 10.1.2.20 --guardium-ip 10.50.20.31
+```
 
-### Destroy a specific role
+### GIM (Guardium Installation Manager — IBM recommended for enterprise)
+```bash
+# Automated (push to multiple DB servers):
+ansible-playbook ansible/playbooks/install-stap-gim.yml \
+  -e gim_server_url=https://10.50.20.31:8082 \
+  -e gim_username=admin -e gim_password=secret \
+  -e guardium_collector_ip=10.50.20.31 \
+  -e '{"db_hosts":[
+        {"host":"10.1.2.10","os_type":"linux","db_type":"oracle"},
+        {"host":"10.1.2.20","os_type":"windows","db_type":"mssql"}
+      ]}'
 
-The repo does not have a separate per-role destroy command; the supported destruction path is the full Terraform destroy guarded by `GUARDIUM_ALLOW_DESTROY=yes`.
+# Manual one-liner (all three GIM methods printed):
+python3 -m guardapi.stap manual --method gim \
+  --host 10.1.2.10 --guardium-ip 10.50.20.31 \
+  --gim-url https://10.50.20.31:8082
+```
 
-`collector`/`aggregator`/`full` create the VM (if not already created) and automatically select the correct Guardium installer menu entry: entry 1 (`std`) for Collector, entry 3 (`agg`) for Aggregator. Boot selection only runs once per VM (tracked in `state/deployment.yml`).
+---
 
-`converge <role>` waits for the appliance to answer SSH at its configured IP, then runs [ansible/playbooks/wait-for-guardium.yml](ansible/playbooks/wait-for-guardium.yml) to complete host configuration and validation. This requires the Guardium NM_setup first-boot wizard to already be completed on the console (see limitation below).
+## Environment variables (credentials — never in config files)
 
-The legacy `scripts/deploy-guardium.sh` name delegates to the same CLI.
+| Variable | Purpose |
+|---|---|
+| `GUARDIUM_COLLECTOR_USERNAME` | Collector admin username |
+| `GUARDIUM_COLLECTOR_PASSWORD` | Collector admin password |
+| `GUARDIUM_AGGREGATOR_USERNAME` | Aggregator admin username |
+| `GUARDIUM_AGGREGATOR_PASSWORD` | Aggregator admin password |
+| `GIM_USERNAME` | GIM admin username |
+| `GIM_PASSWORD` | GIM admin password |
+| `GIM_SERVER_URL` | GIM server URL (https://ip:8082) |
+| `VSPHERE_USER` / `VSPHERE_PASSWORD` / `VSPHERE_SERVER` | vCenter auth |
+| `GOOGLE_APPLICATION_CREDENTIALS` | GCP service account key |
+| `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | AWS credentials |
+| `ARM_CLIENT_ID` / `ARM_CLIENT_SECRET` / `ARM_TENANT_ID` | Azure credentials |
 
-The CLI validates the host, ISO, bridge, and Terraform configuration before provisioning. It does not claim that a Guardium appliance is installed merely because a VM exists. Installation, registration, GIM, S-TAP, database, and Central Manager commands remain explicit release-specific adapter boundaries until their supported IBM mechanisms are verified for the configured Guardium release.
+---
 
-## Safety and state
+## Safety
 
-The automation never creates a bridge, deletes an existing network, wipes a disk, or destroys a VM automatically. Destruction requires `GUARDIUM_ALLOW_DESTROY=yes` and an interactive `DESTROY` confirmation. Verified infrastructure stages are recorded in [state/deployment.yml](state/deployment.yml); the file contains no secrets.
-
-Terraform manages only VM infrastructure: CPU, memory, disks, ISO media, boot order, and the configured existing bridge. Guardium application behavior belongs in Ansible and the version-specific Python adapters under [guardapi](guardapi).
-
-## Prerequisites and limitations
-
-Install Terraform or OpenTofu, the libvirt provider, Ansible, Python 3, PyYAML, and the appropriate host permissions before provisioning. Terraform/OpenTofu is not installed in the current environment, so a real VM plan/apply has not been run. The Guardium ISO's exact role-selection and post-install API behavior must be validated against IBM documentation or a controlled installation before enabling those adapters; no undocumented commands or endpoints are guessed here.
-# guardium-deployment
-# guardium-deployment
-# guardium-deployment
-# guardium-deployment
+- Destruction requires `GUARDIUM_ALLOW_DESTROY=yes` and typing `DESTROY` interactively.
+- No credentials are stored in config files or state.
+- S-TAP automation always prompts before touching any DB server.

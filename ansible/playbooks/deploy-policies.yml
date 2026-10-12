@@ -1,0 +1,26 @@
+---
+# Deploy Guardium sample security policies to a Collector.
+# Required --extra-vars: collector_url, collector_username, collector_password
+
+- name: Deploy Guardium sample policies
+  hosts: localhost
+  gather_facts: false
+  vars:
+    install_policies: true
+    verify_tls: false
+  tasks:
+    - name: Deploy policies via guardapi.policies
+      ansible.builtin.command:
+        cmd: >
+          {{ playbook_dir }}/../../.venv/bin/python3 -m guardapi.policies
+          --url {{ collector_url }}
+          --username {{ collector_username }}
+          --password {{ collector_password }}
+          {{ '--no-install' if not (install_policies | bool) else '' }}
+          {{ '--no-verify-tls' if not (verify_tls | bool) else '' }}
+      register: pol_out
+      changed_when: "'Deployed' in pol_out.stdout"
+
+    - name: Show result
+      ansible.builtin.debug:
+        msg: "{{ pol_out.stdout_lines }}"

@@ -1,0 +1,56 @@
+---
+# Install S-TAP on Windows DB servers via WinRM.
+# Inventory group: [stap_windows]
+# Each host must set: ansible_connection=winrm, ansible_winrm_transport=ntlm,
+#                     ansible_user, ansible_password, ansible_port=5985
+
+- name: Install S-TAP on Windows DB servers via WinRM
+  hosts: stap_windows
+  gather_facts: false
+  serial: 5
+  vars:
+    guardium_version: "12.2"
+    db_type: "mssql"
+    dry_run: false
+
+  tasks:
+    - name: Copy S-TAP MSI to target
+      ansible.windows.win_copy:
+        src: "{{ stap_msi_path }}"
+        dest: 'C:\Windows\Temp\guard-stap.msi'
+      when:
+        - stap_msi_path is defined
+        - not (dry_run | bool)
+
+    - name: Install S-TAP MSI silently
+      ansible.windows.win_package:
+        path: 'C:\Windows\Temp\guard-stap.msi'
+        state: present
+        arguments: >-
+          /quiet /norestart
+          GUARD_IP="{{ guardium_collector_ip }}"
+          GUARD_PORT="8075"
+          DB_TYPE="{{ db_type }}"
+      when: not (dry_run | bool)
+
+    - name: Dry-run notice
+      ansible.builtin.debug:
+        msg: "[DRY-RUN] Would install S-TAP {{ guardium_version }} on {{ inventory_hostname }} (Windows), collector={{ guardium_collector_ip }}"
+      when: dry_run | bool
+
+    - name: Ensure IBM Guardium S-TAP service is running
+      ansible.windows.win_service:
+        name: "IBM Guardium S-TAP"
+        state: started
+        start_mode: auto
+      when: not (dry_run | bool)
+
+    - name: Show service status
+      ansible.windows.win_service:
+        name: "IBM Guardium S-TAP"
+      register: stap_svc
+      when: not (dry_run | bool)
+
+    - name: Report
+      ansible.builtin.debug:
+        msg: "IBM Guardium S-TAP on {{ inventory_hostname }}: {{ stap_svc.state | default('dry-run') }}"

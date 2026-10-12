@@ -1,22 +1,70 @@
+# ── Customer deployment configuration template ────────────────────────────────
+# Copy to config/customer-<name>.yml and fill in values.
+# Credentials: use environment variables — never put passwords in this file.
+
 project:
   name: customer-guardium
 
 guardium:
-  version: "12.x"
-  iso_path: ""
+  version: "12.2"
+  iso_path: ""                    # for KVM/vSphere OVA local path only
+  install_timeout_minutes: 90
 
+# ── Cloud / hypervisor target ─────────────────────────────────────────────────
+# Values: kvm | vsphere | gcp | aws | azure
+cloud:
+  provider: kvm
+
+# ── On-prem KVM (lab) ─────────────────────────────────────────────────────────
 kvm:
   storage_pool: default
-
 network:
   type: ovs
   ovs_bridge: ""
 
-credentials:
-  source: environment
-  guardium_username: "${GUARDIUM_USERNAME}"
-  guardium_password: "${GUARDIUM_PASSWORD}"
+# ── VMware vSphere / vCenter ──────────────────────────────────────────────────
+vsphere:
+  server: ""              # vCenter FQDN or IP
+  datacenter: ""
+  cluster: ""
+  datastore: ""
+  network: ""             # Port group name
+  content_library: ""     # Content library name
+  content_library_item: "" # OVA/OVF item name
+  vm_folder: "guardium"
+  # Auth via env: VSPHERE_USER, VSPHERE_PASSWORD
 
+# ── GCP ───────────────────────────────────────────────────────────────────────
+gcp:
+  project_id: ""
+  region: ""
+  zone: ""
+  subnetwork: ""
+  guardium_image: ""       # custom image built from Guardium ISO
+  machine_type: "n2-standard-8"
+  # Auth via GOOGLE_APPLICATION_CREDENTIALS or gcloud ADC
+
+# ── AWS ───────────────────────────────────────────────────────────────────────
+aws:
+  region: "us-east-1"
+  guardium_ami_id: ""      # AMI imported via VM Import/Export
+  instance_type: "m5.2xlarge"
+  subnet_id: ""
+  security_group_ids: []
+  # Auth via AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY or instance role
+
+# ── Azure ─────────────────────────────────────────────────────────────────────
+azure:
+  subscription_id: ""
+  resource_group: ""
+  location: ""             # e.g. eastus
+  vm_size: "Standard_D8s_v5"
+  guardium_image_id: ""    # managed image resource ID
+  subnet_id: ""
+  admin_ssh_public_key: "" # placeholder required by Azure; not used by Guardium
+  # Auth via ARM_CLIENT_ID, ARM_CLIENT_SECRET, ARM_TENANT_ID
+
+# ── Appliance definitions ─────────────────────────────────────────────────────
 collector:
   enabled: true
   hostname: gdp-col01.example.invalid
@@ -41,6 +89,25 @@ central_manager:
   memory_gb: 16
   disk_gb: 300
 
+# ── GIM (Guardium Installation Manager) ───────────────────────────────────────
+gim:
+  server_url: ""            # https://<collector-or-dedicated-host>:8082
+  # Auth via env: GIM_USERNAME, GIM_PASSWORD
+
+# ── S-TAP target DB servers ───────────────────────────────────────────────────
+# Populate ansible/inventory/hosts.yml with actual DB server IPs.
 agents:
   gim: false
   stap: false
+  stap_method: gim          # gim | ssh | winrm
+  guardium_version: "12.2"
+
+# ── Credentials (environment variable references — never literal values) ──────
+credentials:
+  source: environment
+  collector_username: "${GUARDIUM_COLLECTOR_USERNAME}"
+  collector_password: "${GUARDIUM_COLLECTOR_PASSWORD}"
+  aggregator_username: "${GUARDIUM_AGGREGATOR_USERNAME}"
+  aggregator_password: "${GUARDIUM_AGGREGATOR_PASSWORD}"
+  gim_username: "${GIM_USERNAME}"
+  gim_password: "${GIM_PASSWORD}"

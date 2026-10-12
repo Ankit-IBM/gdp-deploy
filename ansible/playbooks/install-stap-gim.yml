@@ -1,0 +1,47 @@
+---
+# Install S-TAP via GIM (Guardium Installation Manager) on one or many DB hosts.
+# GIM is the IBM-recommended enterprise-scale S-TAP deployment method.
+#
+# GIM manages: install, upgrade, removal, config push, health monitoring.
+#
+# Required --extra-vars:
+#   gim_server_url, gim_username, gim_password
+#   guardium_collector_ip
+#   db_hosts   (JSON list of {host, os_type, db_type})
+#   e.g.  -e '{"db_hosts":[{"host":"10.1.2.3","os_type":"linux","db_type":"oracle"}]}'
+#
+# On user 'no' at the prompt, guardapi.stap prints manual one-liner commands.
+
+- name: Install S-TAP via GIM
+  hosts: localhost
+  gather_facts: false
+  vars:
+    guardium_version: "12.2"
+    dry_run: false
+
+  tasks:
+    - name: Push GIM installation job for each DB host
+      ansible.builtin.command:
+        cmd: >
+          {{ playbook_dir }}/../../.venv/bin/python3 -m guardapi.stap gim
+          --host {{ item.host }}
+          --guardium-ip {{ guardium_collector_ip }}
+          --gim-url {{ gim_server_url }}
+          --gim-user {{ gim_username }}
+          --gim-password {{ gim_password }}
+          --os-type {{ item.os_type | default('linux') }}
+          --db-type {{ item.db_type | default('all') }}
+          --version {{ guardium_version }}
+          --no-verify-tls
+          --no-prompt
+          {{ '--dry-run' if dry_run | bool else '' }}
+      loop: "{{ db_hosts }}"
+      register: gim_results
+      changed_when: "'job' in item.stdout | default('')"
+
+    - name: Show GIM results
+      ansible.builtin.debug:
+        msg: "{{ item.stdout_lines }}"
+      loop: "{{ gim_results.results }}"
+      loop_control:
+        label: "{{ item.item.host }}"
