@@ -1,11 +1,26 @@
-"""Validation adapter boundary for release-specific Guardium checks."""
+"""Guardium appliance validation helpers."""
+
+import logging
+from .client import GuardiumClient
+
+LOG = logging.getLogger(__name__)
 
 
-class ValidationNotImplemented(RuntimeError):
-    """Raised when a requested check has not been verified for the release."""
+def validate_appliance(*, host: str, role: str, version: str,
+                       username: str = "admin", password: str = "",
+                       verify_tls: bool = False) -> dict:
+    """Check basic REST API reachability for a Guardium appliance.
 
-
-def validate_appliance(*, host: str, role: str, version: str) -> None:
-    raise ValidationNotImplemented(
-        f"Guardium {version} {role} validation is not enabled until its documented API/CLI is verified"
+    Calls GET /restAPI/system_info on the appliance and returns the
+    response payload. Raises GuardiumApiError on connection failure.
+    """
+    client = GuardiumClient(
+        base_url=f"https://{host}:8443",
+        username=username,
+        password=password,
+        verify_tls=verify_tls,
     )
+    LOG.info("Validating Guardium %s appliance at %s (version %s)", role, host, version)
+    result = client.request("GET", "/restAPI/system_info") or {}
+    LOG.info("Validation response: %s", result)
+    return result
