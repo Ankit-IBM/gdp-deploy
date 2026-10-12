@@ -262,3 +262,4 @@ python3 -m guardapi.stap manual --method gim \
 - Destruction requires `GUARDIUM_ALLOW_DESTROY=yes` and typing `DESTROY` interactively.
 - No credentials are stored in config files or state.
 - S-TAP automation always prompts before touching any DB server.
+# gdp-deploy
