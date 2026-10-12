@@ -1,50 +1,44 @@
 # ── Multi-cloud dispatch ─────────────────────────────────────────────────────
-# Set var.cloud_provider to "kvm" (default/lab), "vsphere", "gcp", "aws", or
-# "azure". Only the selected provider's module is instantiated; all others have
-# count = 0.  Each module exposes the same output interface:
-#   module.guardium_<role>_<provider>[0].vm_ip
-#   module.guardium_<role>_<provider>[0].hostname
-#
-# KVM/libvirt (lab default) is already wired in main.tf. This file adds the
-# cloud-provider modules without touching the existing libvirt module.
+# Set var.cloud_provider: kvm | vsphere | gcp | aws | azure
+# Only the selected provider's module is instantiated (count = 0 for others).
 
-# ── vSphere / on-prem vCenter ────────────────────────────────────────────────
+# ── vSphere / on-prem vCenter ─────────────────────────────────────────────────
+# Boots from an ISO stored on a vSphere Datastore (no OVA/content-library needed).
+# Upload the ISO to the datastore first, then set vsphere_iso_datastore_path.
 module "guardium_collector_vsphere" {
   count  = (var.cloud_provider == "vsphere" && var.deploy_collector) ? 1 : 0
   source = "./modules/guardium-vsphere"
 
-  name                  = var.collector_name
-  fqdn                  = var.collector_hostname
-  vm_ip                 = var.collector_ip
-  cpu                   = var.collector_cpu
-  memory_mb             = var.collector_memory_mb
-  disk_gb               = var.collector_disk_gb
-  datacenter            = var.vsphere_datacenter
-  cluster               = var.vsphere_cluster
-  datastore             = var.vsphere_datastore
-  network_name          = var.vsphere_network
-  content_library_name  = var.vsphere_content_library
-  content_library_item  = var.vsphere_content_library_item
-  vm_folder             = var.vsphere_vm_folder
+  name               = var.collector_name
+  fqdn               = var.collector_hostname
+  vm_ip              = var.collector_ip
+  cpu                = var.collector_cpu
+  memory_mb          = var.collector_memory_mb
+  disk_gb            = var.collector_disk_gb
+  datacenter         = var.vsphere_datacenter
+  cluster            = var.vsphere_cluster
+  datastore          = var.vsphere_datastore
+  network_name       = var.vsphere_network
+  iso_datastore_path = var.vsphere_iso_datastore_path
+  vm_folder          = var.vsphere_vm_folder
 }
 
 module "guardium_aggregator_vsphere" {
   count  = (var.cloud_provider == "vsphere" && var.deploy_aggregator) ? 1 : 0
   source = "./modules/guardium-vsphere"
 
-  name                  = var.aggregator_name
-  fqdn                  = var.aggregator_hostname
-  vm_ip                 = var.aggregator_ip
-  cpu                   = var.aggregator_cpu
-  memory_mb             = var.aggregator_memory_mb
-  disk_gb               = var.aggregator_disk_gb
-  datacenter            = var.vsphere_datacenter
-  cluster               = var.vsphere_cluster
-  datastore             = var.vsphere_datastore
-  network_name          = var.vsphere_network
-  content_library_name  = var.vsphere_content_library
-  content_library_item  = var.vsphere_content_library_item
-  vm_folder             = var.vsphere_vm_folder
+  name               = var.aggregator_name
+  fqdn               = var.aggregator_hostname
+  vm_ip              = var.aggregator_ip
+  cpu                = var.aggregator_cpu
+  memory_mb          = var.aggregator_memory_mb
+  disk_gb            = var.aggregator_disk_gb
+  datacenter         = var.vsphere_datacenter
+  cluster            = var.vsphere_cluster
+  datastore          = var.vsphere_datastore
+  network_name       = var.vsphere_network
+  iso_datastore_path = var.vsphere_iso_datastore_path
+  vm_folder          = var.vsphere_vm_folder
 }
 
 # ── GCP ───────────────────────────────────────────────────────────────────────

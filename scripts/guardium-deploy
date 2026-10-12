@@ -66,27 +66,80 @@ venv_python() {
   if [[ -x "$venv/bin/python3" ]]; then printf '%s/bin/python3\n' "$venv"; else printf 'python3\n'; fi
 }
 
-# ── ISO / bridge / terraform validation ──────────────────────────────────────
-select_iso() {
-  local configured; configured="$(config_value guardium.iso_path)"
-  if [[ -n "$configured" ]]; then
-    [[ -f "$configured" ]] || { error "ISO not found: $configured"; return 1; }
-    printf '%s\n' "$configured"; return 0
-  fi
-  mapfile -t images < <(find /home/dev -maxdepth 1 -type f \( -iname '*.iso' -o -iname '*.img' \) | sort)
-  case "${#images[@]}" in
-    0) error "No Guardium ISO found under /home/dev"; return 1 ;;
-    1) printf '%s\n' "${images[0]}"; return 0 ;;
+# ── ISO / image / bridge / terraform validation ───────────────────────────────
+# select_cloud_image — called before terraform_apply for cloud providers.
+# Lists available images/ISOs on the target platform, prompts user to pick one,
+# and exports the result as IMAGE_ID (consumed by terraform_apply).
+select_cloud_image() {
+  local provider="$1"
+  local list_script="$PROJECT_ROOT/scripts/list-images.py"
+  [[ -x "$list_script" ]] || chmod +x "$list_script"
+
+  case "$provider" in
+    vsphere)
+      local server datastore
+      server="$(config_value vsphere.server)"
+      datastore="$(config_value vsphere.datastore)"
+      [[ -n "$server" && -n "$datastore" ]] || {
+        error "vsphere.server and vsphere.datastore must be set in $CONFIG_FILE"; return 1
+      }
+      log "Listing Guardium ISOs on vSphere datastore '$datastore' at $server..."
+      IMAGE_ID="$( "$(venv_python)" "$list_script" vsphere         --server "$server" --datastore "$datastore"         --vsphere-user "${VSPHERE_USER:-}"         --vsphere-password "${VSPHERE_PASSWORD:-}"         --allow-unverified-ssl 2>/dev/tty )"
+      ;;
+    aws)
+      local region; region="$(config_value aws.region)"
+      region="${region:-${AWS_DEFAULT_REGION:-us-east-1}}"
+      log "Listing Guardium AMIs in AWS region $region..."
+      IMAGE_ID="$( "$(venv_python)" "$list_script" aws --region "$region" 2>/dev/tty )"
+      ;;
+    gcp)
+      local project; project="$(config_value gcp.project_id)"
+      [[ -n "$project" ]] || { error "gcp.project_id must be set in $CONFIG_FILE"; return 1; }
+      log "Listing Guardium images in GCP project $project..."
+      IMAGE_ID="$( "$(venv_python)" "$list_script" gcp --project "$project" 2>/dev/tty )"
+      ;;
+    azure)
+      local sub rg
+      sub="$(config_value azure.subscription_id)"
+      rg="$(config_value azure.resource_group)"
+      [[ -n "$sub" ]] || { error "azure.subscription_id must be set in $CONFIG_FILE"; return 1; }
+      log "Listing Guardium images in Azure subscription $sub..."
+      IMAGE_ID="$( "$(venv_python)" "$list_script" azure         --subscription "$sub" --resource-group "$rg" 2>/dev/tty )"
+      ;;
+    kvm)
+      # KVM: use local ISO path
+      local configured; configured="$(config_value guardium.iso_path)"
+      if [[ -n "$configured" ]]; then
+        [[ -f "$configured" ]] || { error "ISO not found: $configured"; return 1; }
+        IMAGE_ID="$configured"; return 0
+      fi
+      mapfile -t isos < <(find /home/dev -maxdepth 1 -type f \( -iname '*.iso' -o -iname '*.img' \) | sort)
+      case "${#isos[@]}" in
+        0) error "No Guardium ISO found under /home/dev"; return 1 ;;
+        1) IMAGE_ID="${isos[0]}"; return 0 ;;
+      esac
+      [[ -t 0 ]] || { error "Set guardium.iso_path for non-interactive KVM use"; return 1; }
+      printf '\nAvailable ISOs:\n' >&2
+      local i=1; for img in "${isos[@]}"; do printf '  %d. %s\n' "$i" "$img" >&2; ((i++)); done
+      read -r -p 'Select ISO number: ' sel
+      IMAGE_ID="${isos[$((sel-1))]}"
+      ;;
+    *)
+      error "Unknown cloud_provider: $provider"; return 1 ;;
   esac
-  [[ -t 0 ]] || { error "Set guardium.iso_path when running non-interactively"; return 1; }
-  local i=1; for img in "${images[@]}"; do printf '  %d. %s\n' "$i" "$img" >&2; ((i++)); done
-  read -r -p 'Select image number: ' sel
-  printf '%s\n' "${images[$((sel-1))]}"
+
+  [[ -n "$IMAGE_ID" ]] || { error "No image selected for provider $provider"; return 1; }
+  log "Selected image: $IMAGE_ID"
 }
 
 validate_host() {
-  require_command virsh  || return 1
-  require_command ip     || return 1
+  local provider; provider="$(config_value cloud.provider 2>/dev/null || echo kvm)"
+  if [[ "$provider" != "kvm" ]]; then
+    log "Cloud provider '$provider' selected — skipping KVM/libvirt host validation"
+    return 0
+  fi
+  require_command virsh     || return 1
+  require_command ip        || return 1
   require_command ovs-vsctl || return 1
   sudo -n virsh version >/dev/null 2>&1 || { error "libvirt not reachable (requires passwordless sudo)"; return 1; }
   local bridge; bridge="$(config_value network.ovs_bridge)"
@@ -111,19 +164,23 @@ PY
 }
 
 terraform_apply() {
-  local role="$1" iso="$2"
+  local role="$1" image_id="$2"
   local iac; iac="$(command -v terraform || command -v tofu || true)"
   [[ -n "$iac" ]] || { error "Install Terraform or OpenTofu before provisioning"; return 1; }
-  local bridge pool; bridge="$(config_value network.ovs_bridge)"; pool="$(config_value kvm.storage_pool)"
+
+  local provider; provider="$(config_value cloud.provider 2>/dev/null || echo kvm)"
+  local bridge pool
+  bridge="$(config_value network.ovs_bridge)"
+  pool="$(config_value kvm.storage_pool)"
+
   update_deploy_flags "$role"
-  sudo -n "$iac" -chdir="$PROJECT_ROOT/terraform" init -upgrade -input=false
-  sudo -n "$iac" -chdir="$PROJECT_ROOT/terraform" validate
+  "$iac" -chdir="$PROJECT_ROOT/terraform" init -upgrade -input=false
+  "$iac" -chdir="$PROJECT_ROOT/terraform" validate
+
+  # ── Base vars (all providers) ─────────────────────────────────────────────
   local args=(
     -auto-approve -input=false
-    -var "iso_path=$iso"
-    -var "network_bridge=$bridge"
-    -var "storage_pool=$pool"
-    -var "cloud_provider=$(config_value cloud.provider 2>/dev/null || echo kvm)"
+    -var "cloud_provider=$provider"
     -var "collector_name=$(config_value collector.hostname)"
     -var "collector_hostname=$(config_value collector.hostname)"
     -var "collector_ip=$(config_value collector.ip)"
@@ -137,7 +194,59 @@ terraform_apply() {
     -var "aggregator_memory_mb=$(( $(config_value aggregator.memory_gb) * 1024 ))"
     -var "aggregator_disk_gb=$(config_value aggregator.disk_gb)"
   )
-  sudo -n "$iac" -chdir="$PROJECT_ROOT/terraform" apply "${args[@]}"
+
+  # ── Provider-specific image/ISO var ───────────────────────────────────────
+  case "$provider" in
+    kvm)
+      args+=( -var "iso_path=$image_id" -var "network_bridge=$bridge" -var "storage_pool=$pool" )
+      ;;
+    vsphere)
+      args+=(
+        -var "vsphere_server=$(config_value vsphere.server)"
+        -var "vsphere_datacenter=$(config_value vsphere.datacenter)"
+        -var "vsphere_cluster=$(config_value vsphere.cluster)"
+        -var "vsphere_datastore=$(config_value vsphere.datastore)"
+        -var "vsphere_network=$(config_value vsphere.network)"
+        -var "vsphere_vm_folder=$(config_value vsphere.vm_folder)"
+        -var "vsphere_iso_datastore_path=$image_id"
+      )
+      ;;
+    aws)
+      args+=(
+        -var "aws_region=$(config_value aws.region)"
+        -var "aws_guardium_ami_id=$image_id"
+        -var "aws_instance_type=$(config_value aws.instance_type)"
+        -var "aws_subnet_id=$(config_value aws.subnet_id)"
+      )
+      ;;
+    gcp)
+      args+=(
+        -var "gcp_project_id=$(config_value gcp.project_id)"
+        -var "gcp_region=$(config_value gcp.region)"
+        -var "gcp_zone=$(config_value gcp.zone)"
+        -var "gcp_subnetwork=$(config_value gcp.subnetwork)"
+        -var "gcp_machine_type=$(config_value gcp.machine_type)"
+        -var "gcp_guardium_image=$image_id"
+      )
+      ;;
+    azure)
+      args+=(
+        -var "azure_subscription_id=$(config_value azure.subscription_id)"
+        -var "azure_resource_group=$(config_value azure.resource_group)"
+        -var "azure_location=$(config_value azure.location)"
+        -var "azure_vm_size=$(config_value azure.vm_size)"
+        -var "azure_subnet_id=$(config_value azure.subnet_id)"
+        -var "azure_guardium_image_id=$image_id"
+        -var "azure_admin_ssh_public_key=$(config_value azure.admin_ssh_public_key)"
+      )
+      ;;
+  esac
+
+  if [[ "$provider" == "kvm" ]]; then
+    sudo -n "$iac" -chdir="$PROJECT_ROOT/terraform" apply "${args[@]}"
+  else
+    "$iac" -chdir="$PROJECT_ROOT/terraform" apply "${args[@]}"
+  fi
 }
 
 select_boot_entry() {
@@ -164,18 +273,29 @@ maybe_select_boot_entry() {
 }
 
 provision() {
-  local role="$1" iso
+  local role="$1"
+  local provider; provider="$(config_value cloud.provider 2>/dev/null || echo kvm)"
   validate_host || return 1
-  iso="$(select_iso)"  || return 1
-  log "Using ISO: $iso"
-  terraform_apply "$role" "$iso" || return 1
-  [[ "$role" == collector || "$role" == full ]] && state_set collector.vm_created true
+
+  log "Selecting image for provider: $provider"
+  local IMAGE_ID=""
+  select_cloud_image "$provider" || return 1
+
+  log "Deploying '$role' on $provider with image: $IMAGE_ID"
+  terraform_apply "$role" "$IMAGE_ID" || return 1
+
+  [[ "$role" == collector  || "$role" == full ]] && state_set collector.vm_created true
   [[ "$role" == aggregator || "$role" == full ]] && state_set aggregator.vm_created true
-  case "$role" in
-    collector)  maybe_select_boot_entry collector  ;;
-    aggregator) maybe_select_boot_entry aggregator ;;
-    full)       maybe_select_boot_entry collector && maybe_select_boot_entry aggregator ;;
-  esac
+
+  # Boot entry selection only applies to KVM (virsh key injection)
+  if [[ "$provider" == "kvm" ]]; then
+    case "$role" in
+      collector)  maybe_select_boot_entry collector  ;;
+      aggregator) maybe_select_boot_entry aggregator ;;
+      full)       maybe_select_boot_entry collector && maybe_select_boot_entry aggregator ;;
+    esac
+  fi
+
   log "Infrastructure done. Run 'converge <role>' once network is up."
 }
 
