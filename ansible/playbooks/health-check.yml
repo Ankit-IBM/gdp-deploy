@@ -1,0 +1,44 @@
+---
+# Run health-checks against all configured Guardium appliances.
+# Reads IPs from config YAML; credentials from environment variables.
+#
+# Required env vars:
+#   GUARDIUM_COLLECTOR_PASSWORD
+#   GUARDIUM_AGGREGATOR_PASSWORD        (if aggregator.enabled: true)
+#   GUARDIUM_CENTRAL_MANAGER_PASSWORD   (if central_manager.enabled: true)
+#
+# Usage:
+#   ansible-playbook ansible/playbooks/health-check.yml \
+#     --extra-vars "config_file=/path/to/config.yml"
+
+- name: Guardium Appliance Health Check
+  hosts: localhost
+  gather_facts: false
+  vars:
+    config_file: "{{ playbook_dir }}/../../config/lab.yml"
+    no_verify_tls: true
+
+  tasks:
+    - name: Run health-check on all appliances
+      ansible.builtin.command:
+        cmd: >
+          {{ playbook_dir }}/../../.venv/bin/python3 -c "
+          import sys, yaml, logging, json
+          logging.basicConfig(level=logging.WARNING)
+          sys.path.insert(0, '{{ playbook_dir }}/../..')
+          from guardapi.health import check_all_appliances, print_health_report
+          with open('{{ config_file }}') as f:
+              config = yaml.safe_load(f)
+          results = check_all_appliances(config, verify_tls={{ 'False' if no_verify_tls else 'True' }})
+          print_health_report(results)
+          failed = [r for r in results if not r.get('healthy')]
+          if failed:
+              sys.exit(1)
+          "
+      register: health_out
+      changed_when: false
+      failed_when: health_out.rc != 0
+
+    - name: Show health report
+      ansible.builtin.debug:
+        msg: "{{ health_out.stdout_lines }}"

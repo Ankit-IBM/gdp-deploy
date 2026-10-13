@@ -1,0 +1,59 @@
+---
+# Register multiple collectors to one aggregator in parallel.
+#
+# Required --extra-vars:
+#   aggregator_ip, aggregator_username, aggregator_password
+#   collectors: JSON list of {ip, username, password}
+#
+# Example:
+#   ansible-playbook ansible/playbooks/register-multi-collector.yml \
+#     -e aggregator_ip=10.50.20.21 \
+#     -e aggregator_username=admin \
+#     -e aggregator_password=secret \
+#     -e '{"collectors":[{"ip":"10.50.20.31","username":"admin","password":"s1"},
+#                         {"ip":"10.50.20.32","username":"admin","password":"s2"}]}'
+
+- name: Register Multiple Collectors to Aggregator
+  hosts: localhost
+  gather_facts: false
+
+  tasks:
+    - name: Register each collector
+      ansible.builtin.command:
+        cmd: >
+          {{ playbook_dir }}/../../.venv/bin/python3 -c "
+          import sys, logging
+          logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
+          sys.path.insert(0, '{{ playbook_dir }}/../..')
+          from guardapi.registration import register_collector_to_aggregator, verify_registration
+          col = dict(ip='{{ item.ip }}', username='{{ item.username }}', password='{{ item.password }}')
+          register_collector_to_aggregator(
+              collector_url='https://{{ item.ip }}:8443',
+              collector_username=col['username'],
+              collector_password=col['password'],
+              aggregator_ip='{{ aggregator_ip }}',
+              aggregator_username='{{ aggregator_username }}',
+              aggregator_password='{{ aggregator_password }}',
+              verify_tls=False,
+          )
+          ok = verify_registration(
+              aggregator_url='https://{{ aggregator_ip }}:8443',
+              aggregator_username='{{ aggregator_username }}',
+              aggregator_password='{{ aggregator_password }}',
+              collector_ip='{{ item.ip }}',
+              verify_tls=False,
+          )
+          print('VERIFIED' if ok else 'UNCONFIRMED')
+          "
+      loop: "{{ collectors }}"
+      loop_control:
+        label: "collector {{ item.ip }}"
+      register: reg_results
+      changed_when: "'VERIFIED' in item.stdout | default('')"
+
+    - name: Show registration results
+      ansible.builtin.debug:
+        msg: "Collector {{ item.item.ip }}: {{ item.stdout_lines }}"
+      loop: "{{ reg_results.results }}"
+      loop_control:
+        label: "{{ item.item.ip }}"

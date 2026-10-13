@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# IBM Guardium Deployment Automation — enhanced multi-cloud + full lifecycle
+# IBM Guardium Deployment Automation — full lifecycle + GI + health-check
 # Usage: ./scripts/guardium-deploy <command> [args...]
 set -uo pipefail
 
@@ -60,16 +60,20 @@ print('' if cur is None else cur)
 PY
 }
 
-# ── venv helper ──────────────────────────────────────────────────────────────
+# ── venv helper ───────────────────────────────────────────────────────────────
 venv_python() {
   local venv="$PROJECT_ROOT/.venv"
   if [[ -x "$venv/bin/python3" ]]; then printf '%s/bin/python3\n' "$venv"; else printf 'python3\n'; fi
 }
 
-# ── ISO / image / bridge / terraform validation ───────────────────────────────
-# select_cloud_image — called before terraform_apply for cloud providers.
-# Lists available images/ISOs on the target platform, prompts user to pick one,
-# and exports the result as IMAGE_ID (consumed by terraform_apply).
+# ── validate_host ─────────────────────────────────────────────────────────────
+validate_host() {
+  local iac; iac="$(command -v terraform || command -v tofu || true)"
+  [[ -n "$iac" ]] || { error "Install Terraform or OpenTofu to provision infrastructure"; return 1; }
+  return 0
+}
+
+# ── Image / ISO picker ────────────────────────────────────────────────────────
 select_cloud_image() {
   local provider="$1"
   local list_script="$PROJECT_ROOT/scripts/list-images.py"
@@ -83,19 +87,20 @@ select_cloud_image() {
       [[ -n "$server" && -n "$datastore" ]] || {
         error "vsphere.server and vsphere.datastore must be set in $CONFIG_FILE"; return 1
       }
-      log "Listing Guardium ISOs on vSphere datastore '$datastore' at $server..."
-      IMAGE_ID="$( "$(venv_python)" "$list_script" vsphere         --server "$server" --datastore "$datastore"         --vsphere-user "${VSPHERE_USER:-}"         --vsphere-password "${VSPHERE_PASSWORD:-}"         --allow-unverified-ssl 2>/dev/tty )"
+      IMAGE_ID="$( "$(venv_python)" "$list_script" vsphere \
+        --server "$server" --datastore "$datastore" \
+        --vsphere-user "${VSPHERE_USER:-}" \
+        --vsphere-password "${VSPHERE_PASSWORD:-}" \
+        --allow-unverified-ssl 2>/dev/tty )"
       ;;
     aws)
       local region; region="$(config_value aws.region)"
-      region="${region:-${AWS_DEFAULT_REGION:-us-east-1}}"
-      log "Listing Guardium AMIs in AWS region $region..."
+      [[ -n "$region" ]] || { error "aws.region must be set in $CONFIG_FILE"; return 1; }
       IMAGE_ID="$( "$(venv_python)" "$list_script" aws --region "$region" 2>/dev/tty )"
       ;;
     gcp)
       local project; project="$(config_value gcp.project_id)"
       [[ -n "$project" ]] || { error "gcp.project_id must be set in $CONFIG_FILE"; return 1; }
-      log "Listing Guardium images in GCP project $project..."
       IMAGE_ID="$( "$(venv_python)" "$list_script" gcp --project "$project" 2>/dev/tty )"
       ;;
     azure)
@@ -103,84 +108,38 @@ select_cloud_image() {
       sub="$(config_value azure.subscription_id)"
       rg="$(config_value azure.resource_group)"
       [[ -n "$sub" ]] || { error "azure.subscription_id must be set in $CONFIG_FILE"; return 1; }
-      log "Listing Guardium images in Azure subscription $sub..."
-      IMAGE_ID="$( "$(venv_python)" "$list_script" azure         --subscription "$sub" --resource-group "$rg" 2>/dev/tty )"
+      IMAGE_ID="$( "$(venv_python)" "$list_script" azure \
+        --subscription "$sub" --resource-group "$rg" 2>/dev/tty )"
       ;;
     kvm)
-      # KVM: use local ISO path
-      local configured; configured="$(config_value guardium.iso_path)"
-      if [[ -n "$configured" ]]; then
-        [[ -f "$configured" ]] || { error "ISO not found: $configured"; return 1; }
-        IMAGE_ID="$configured"; return 0
-      fi
-      mapfile -t isos < <(find /home/dev -maxdepth 1 -type f \( -iname '*.iso' -o -iname '*.img' \) | sort)
-      case "${#isos[@]}" in
-        0) error "No Guardium ISO found under /home/dev"; return 1 ;;
-        1) IMAGE_ID="${isos[0]}"; return 0 ;;
-      esac
-      [[ -t 0 ]] || { error "Set guardium.iso_path for non-interactive KVM use"; return 1; }
-      printf '\nAvailable ISOs:\n' >&2
-      local i=1; for img in "${isos[@]}"; do printf '  %d. %s\n' "$i" "$img" >&2; ((i++)); done
-      read -r -p 'Select ISO number: ' sel
-      IMAGE_ID="${isos[$((sel-1))]}"
+      IMAGE_ID="$(config_value guardium.iso_path)"
+      [[ -n "$IMAGE_ID" ]] || { error "guardium.iso_path must be set in $CONFIG_FILE"; return 1; }
       ;;
     *)
-      error "Unknown cloud_provider: $provider"; return 1 ;;
+      error "Unknown provider '$provider'. Valid: kvm | vsphere | aws | gcp | azure"
+      return 1
+      ;;
   esac
 
-  [[ -n "$IMAGE_ID" ]] || { error "No image selected for provider $provider"; return 1; }
-  log "Selected image: $IMAGE_ID"
+  [[ -n "${IMAGE_ID:-}" ]] || { error "No image selected for provider '$provider'"; return 1; }
+  log "Image selected: $IMAGE_ID"
 }
 
-validate_host() {
-  local provider; provider="$(config_value cloud.provider 2>/dev/null || echo kvm)"
-  if [[ "$provider" != "kvm" ]]; then
-    log "Cloud provider '$provider' selected — skipping KVM/libvirt host validation"
-    return 0
-  fi
-  require_command virsh     || return 1
-  require_command ip        || return 1
-  require_command ovs-vsctl || return 1
-  sudo -n virsh version >/dev/null 2>&1 || { error "libvirt not reachable (requires passwordless sudo)"; return 1; }
-  local bridge; bridge="$(config_value network.ovs_bridge)"
-  [[ -n "$bridge" ]] || { error "network.ovs_bridge not set in $CONFIG_FILE"; return 1; }
-  sudo -n ovs-vsctl br-exists "$bridge" 2>/dev/null || { error "OVS bridge '$bridge' does not exist"; return 1; }
-  log "Validated OVS bridge: $bridge"
-}
-
-update_deploy_flags() {
-  local role="$1"
-  local flags="$PROJECT_ROOT/terraform/deploy-flags.auto.tfvars.json"
-  python3 - "$flags" "$role" <<'PY'
-import json, os, sys
-path, role = sys.argv[1:]
-flags = {"deploy_collector": False, "deploy_aggregator": False}
-if os.path.exists(path):
-    with open(path) as f: flags.update(json.load(f))
-if role in ("collector","full"): flags["deploy_collector"]  = True
-if role in ("aggregator","full"): flags["deploy_aggregator"] = True
-with open(path,"w") as f: json.dump(flags, f, indent=2); f.write("\n")
-PY
-}
-
+# ── Terraform apply ───────────────────────────────────────────────────────────
 terraform_apply() {
-  local role="$1" image_id="$2"
-  local iac; iac="$(command -v terraform || command -v tofu || true)"
-  [[ -n "$iac" ]] || { error "Install Terraform or OpenTofu before provisioning"; return 1; }
-
+  local role="$1" image_id="${2:-}"
+  local iac; iac="$(command -v terraform || command -v tofu)"
   local provider; provider="$(config_value cloud.provider 2>/dev/null || echo kvm)"
-  local bridge pool
-  bridge="$(config_value network.ovs_bridge)"
-  pool="$(config_value kvm.storage_pool)"
 
-  update_deploy_flags "$role"
-  "$iac" -chdir="$PROJECT_ROOT/terraform" init -upgrade -input=false
-  "$iac" -chdir="$PROJECT_ROOT/terraform" validate
+  # Determine deploy flags
+  local deploy_col=false deploy_agg=false
+  [[ "$role" == collector  || "$role" == full ]] && deploy_col=true
+  [[ "$role" == aggregator || "$role" == full ]] && deploy_agg=true
 
-  # ── Base vars (all providers) ─────────────────────────────────────────────
-  local args=(
-    -auto-approve -input=false
+  local -a tf_vars=(
     -var "cloud_provider=$provider"
+    -var "deploy_collector=$deploy_col"
+    -var "deploy_aggregator=$deploy_agg"
     -var "collector_name=$(config_value collector.hostname)"
     -var "collector_hostname=$(config_value collector.hostname)"
     -var "collector_ip=$(config_value collector.ip)"
@@ -195,13 +154,9 @@ terraform_apply() {
     -var "aggregator_disk_gb=$(config_value aggregator.disk_gb)"
   )
 
-  # ── Provider-specific image/ISO var ───────────────────────────────────────
   case "$provider" in
-    kvm)
-      args+=( -var "iso_path=$image_id" -var "network_bridge=$bridge" -var "storage_pool=$pool" )
-      ;;
     vsphere)
-      args+=(
+      tf_vars+=(
         -var "vsphere_server=$(config_value vsphere.server)"
         -var "vsphere_datacenter=$(config_value vsphere.datacenter)"
         -var "vsphere_cluster=$(config_value vsphere.cluster)"
@@ -212,7 +167,7 @@ terraform_apply() {
       )
       ;;
     aws)
-      args+=(
+      tf_vars+=(
         -var "aws_region=$(config_value aws.region)"
         -var "aws_guardium_ami_id=$image_id"
         -var "aws_instance_type=$(config_value aws.instance_type)"
@@ -220,7 +175,7 @@ terraform_apply() {
       )
       ;;
     gcp)
-      args+=(
+      tf_vars+=(
         -var "gcp_project_id=$(config_value gcp.project_id)"
         -var "gcp_region=$(config_value gcp.region)"
         -var "gcp_zone=$(config_value gcp.zone)"
@@ -230,7 +185,7 @@ terraform_apply() {
       )
       ;;
     azure)
-      args+=(
+      tf_vars+=(
         -var "azure_subscription_id=$(config_value azure.subscription_id)"
         -var "azure_resource_group=$(config_value azure.resource_group)"
         -var "azure_location=$(config_value azure.location)"
@@ -242,13 +197,12 @@ terraform_apply() {
       ;;
   esac
 
-  if [[ "$provider" == "kvm" ]]; then
-    sudo -n "$iac" -chdir="$PROJECT_ROOT/terraform" apply "${args[@]}"
-  else
-    "$iac" -chdir="$PROJECT_ROOT/terraform" apply "${args[@]}"
-  fi
+  log "Running Terraform for role=$role provider=$provider"
+  sudo -n "$iac" -chdir="$PROJECT_ROOT/terraform" init -input=false -upgrade >/dev/null
+  sudo -n "$iac" -chdir="$PROJECT_ROOT/terraform" apply -auto-approve -input=false "${tf_vars[@]}"
 }
 
+# ── KVM boot-entry selector ───────────────────────────────────────────────────
 select_boot_entry() {
   local role="$1" name downs=0
   name="$(config_value "$role.hostname")"
@@ -272,6 +226,7 @@ maybe_select_boot_entry() {
   state_set "$role.install_started" true
 }
 
+# ── provision ─────────────────────────────────────────────────────────────────
 provision() {
   local role="$1"
   local provider; provider="$(config_value cloud.provider 2>/dev/null || echo kvm)"
@@ -287,7 +242,6 @@ provision() {
   [[ "$role" == collector  || "$role" == full ]] && state_set collector.vm_created true
   [[ "$role" == aggregator || "$role" == full ]] && state_set aggregator.vm_created true
 
-  # Boot entry selection only applies to KVM (virsh key injection)
   if [[ "$provider" == "kvm" ]]; then
     case "$role" in
       collector)  maybe_select_boot_entry collector  ;;
@@ -299,23 +253,26 @@ provision() {
   log "Infrastructure done. Run 'converge <role>' once network is up."
 }
 
+# ── converge ──────────────────────────────────────────────────────────────────
 converge() {
   local role="$1" ip timeout
-  [[ "$role" == collector || "$role" == aggregator ]] || { error "converge: invalid role '$role'"; return 1; }
+  [[ "$role" == collector || "$role" == aggregator ]] || {
+    error "converge: invalid role '$role'"; return 1
+  }
   require_command ansible-playbook || return 1
   ip="$(config_value "$role.ip")"
   [[ -n "$ip" ]] || { error "$role.ip not set in $CONFIG_FILE"; return 1; }
   timeout="$(config_value guardium.install_timeout_minutes)"; timeout="${timeout:-30}"
-  log "Converging $role ($ip)…"
+  log "Converging $role ($ip)..."
   ansible-playbook -i "${ip}," "$PROJECT_ROOT/ansible/playbooks/wait-for-guardium.yml" \
     --extra-vars "ansible_host=$ip role=$role converge_timeout_seconds=$((timeout*60))" || return 1
   state_set "$role.install_complete" true
   log "$role converge complete"
 }
 
-# ── Registration ──────────────────────────────────────────────────────────────
+# ── register (single collector) ───────────────────────────────────────────────
 register() {
-  log "Registering Collector → Aggregator"
+  log "Registering Collector -> Aggregator"
   require_command ansible-playbook || return 1
 
   local col_ip agg_ip col_url
@@ -323,7 +280,6 @@ register() {
   agg_ip="$(config_value aggregator.ip)"
   col_url="https://${col_ip}:8443"
 
-  # Credentials from environment (never hard-coded)
   local col_user="${GUARDIUM_COLLECTOR_USERNAME:-admin}"
   local col_pass="${GUARDIUM_COLLECTOR_PASSWORD:-}"
   local agg_user="${GUARDIUM_AGGREGATOR_USERNAME:-admin}"
@@ -336,7 +292,7 @@ register() {
       read -r -p "Aggregator admin username [$agg_user]: " in_au; [[ -n "$in_au" ]] && agg_user="$in_au"
       read -rs -p "Aggregator admin password: " agg_pass; echo
     else
-      error "Set GUARDIUM_COLLECTOR_PASSWORD and GUARDIUM_AGGREGATOR_PASSWORD env vars for non-interactive use"
+      error "Set GUARDIUM_COLLECTOR_PASSWORD and GUARDIUM_AGGREGATOR_PASSWORD"
       return 1
     fi
   fi
@@ -353,7 +309,47 @@ register() {
   log "Collector registered to Aggregator"
 }
 
-# ── Policy deployment ─────────────────────────────────────────────────────────
+# ── register-multi (N collectors) ─────────────────────────────────────────────
+register_multi() {
+  log "Registering multiple collectors to Aggregator"
+  require_command ansible-playbook || return 1
+
+  local agg_ip; agg_ip="$(config_value aggregator.ip)"
+  local agg_user="${GUARDIUM_AGGREGATOR_USERNAME:-admin}"
+  local agg_pass="${GUARDIUM_AGGREGATOR_PASSWORD:-}"
+
+  if [[ -z "$agg_pass" && -t 0 ]]; then
+    read -r -p "Aggregator admin username [$agg_user]: " in_au; [[ -n "$in_au" ]] && agg_user="$in_au"
+    read -rs -p "Aggregator admin password: " agg_pass; echo
+  fi
+
+  # Build collector list interactively
+  local collectors_json="["
+  local first=true
+  echo ""
+  echo "Enter each collector IP/username/password. Empty IP to finish."
+  while true; do
+    read -r -p "Collector IP (blank to finish): " c_ip
+    [[ -z "$c_ip" ]] && break
+    local c_user c_pass
+    read -r -p "  Username [admin]: " c_user; c_user="${c_user:-admin}"
+    read -rs -p "  Password: " c_pass; echo
+    [[ "$first" == true ]] && first=false || collectors_json+=","
+    collectors_json+="{\"ip\":\"$c_ip\",\"username\":\"$c_user\",\"password\":\"$c_pass\"}"
+  done
+  collectors_json+="]"
+
+  ansible-playbook "$PROJECT_ROOT/ansible/playbooks/register-multi-collector.yml" \
+    --extra-vars "aggregator_ip=$agg_ip" \
+    --extra-vars "aggregator_username=$agg_user" \
+    --extra-vars "aggregator_password=$agg_pass" \
+    --extra-vars "{\"collectors\":$collectors_json}" || return 1
+
+  state_set registration.multi_registered true
+  log "Multi-collector registration complete"
+}
+
+# ── policies ──────────────────────────────────────────────────────────────────
 policies() {
   log "Deploying sample security policies to Collector"
   require_command ansible-playbook || return 1
@@ -371,26 +367,55 @@ policies() {
     error "Set GUARDIUM_COLLECTOR_PASSWORD for non-interactive policy deployment"; return 1
   fi
 
+  # Ask which policy sets to deploy
+  local policy_set="standard"
+  if [[ -t 0 ]]; then
+    echo ""
+    echo "Policy set options:"
+    echo "  1. Standard  (BASELINE_AUDIT, PCI_DSS, HIPAA, EXTRUSION_DETECT)"
+    echo "  2. Extended  (+ GDPR_PII_AUDIT, SOX_FINANCIAL_AUDIT, CIS_HARDENING_AUDIT)"
+    echo "  3. All       (deploy all 7 policies)"
+    read -r -p "Select [1/2/3] default=1: " ps_sel
+    case "$ps_sel" in
+      2) policy_set="extended" ;;
+      3) policy_set="all"      ;;
+      *) policy_set="standard" ;;
+    esac
+  fi
+
   ansible-playbook "$PROJECT_ROOT/ansible/playbooks/deploy-policies.yml" \
     --extra-vars "collector_url=$col_url" \
     --extra-vars "collector_username=$col_user" \
-    --extra-vars "collector_password=$col_pass" || return 1
+    --extra-vars "collector_password=$col_pass" \
+    --extra-vars "policy_set=$policy_set" || return 1
 
   state_set policies.deployed true
-  log "Sample policies deployed"
+  state_set policies.policy_set "$policy_set"
+  log "Sample policies deployed (set: $policy_set)"
+}
+
+# ── health-check ──────────────────────────────────────────────────────────────
+health_check() {
+  log "Running health-check on all configured appliances"
+  require_command ansible-playbook || return 1
+
+  ansible-playbook "$PROJECT_ROOT/ansible/playbooks/health-check.yml" \
+    --extra-vars "config_file=$CONFIG_FILE" || {
+    log "Health-check found issues — review output above"; return 1
+  }
+  log "Health-check passed"
 }
 
 # ── S-TAP / GIM installation ──────────────────────────────────────────────────
 install_stap() {
   local col_ip; col_ip="$(config_value collector.ip)"
 
-  # Prompt user for method and confirmation
   echo ""
-  echo "S-TAP Installation"
-  echo "────────────────────────────────────────────────────────────────────"
-  echo "  1. SSH   — Linux/Unix DB server (automated via Ansible)"
-  echo "  2. WinRM — Windows DB server    (automated via Ansible)"
-  echo "  3. GIM   — Guardium Installation Manager (IBM enterprise method)"
+  echo "S-TAP / Agent Installation"
+  echo "------------------------------------------------------------------------"
+  echo "  1. SSH    — Linux/Unix DB server (automated via Ansible)"
+  echo "  2. WinRM  — Windows DB server    (automated via Ansible)"
+  echo "  3. GIM    — Guardium Installation Manager (IBM enterprise method)"
   echo "  4. Manual — Print one-liner commands only (no automation)"
   echo ""
 
@@ -403,14 +428,10 @@ install_stap() {
 
   case "$method" in
     1|ssh)
-      echo ""
       read -r -p "Proceed with automated SSH S-TAP install? [Y/n]: " confirm
       if [[ "${confirm,,}" == "n" || "${confirm,,}" == "no" ]]; then
-        log "Automated install declined. Printing manual SSH one-liner commands..."
-        "$(venv_python)" -m guardapi.stap manual \
-          --method ssh \
-          --host "<DB_SERVER_IP>" \
-          --guardium-ip "$col_ip"
+        "$(venv_python)" -m guardapi.stap manual --method ssh \
+          --host "<DB_SERVER_IP>" --guardium-ip "$col_ip"
         return 0
       fi
       ansible-playbook -i "$PROJECT_ROOT/ansible/inventory/hosts.yml" \
@@ -420,14 +441,10 @@ install_stap() {
       ;;
 
     2|winrm)
-      echo ""
       read -r -p "Proceed with automated WinRM S-TAP install? [Y/n]: " confirm
       if [[ "${confirm,,}" == "n" || "${confirm,,}" == "no" ]]; then
-        log "Automated install declined. Printing manual WinRM one-liner commands..."
-        "$(venv_python)" -m guardapi.stap manual \
-          --method winrm \
-          --host "<DB_SERVER_IP>" \
-          --guardium-ip "$col_ip"
+        "$(venv_python)" -m guardapi.stap manual --method winrm \
+          --host "<DB_SERVER_IP>" --guardium-ip "$col_ip"
         return 0
       fi
       ansible-playbook -i "$PROJECT_ROOT/ansible/inventory/hosts.yml" \
@@ -445,16 +462,11 @@ install_stap() {
         read -r -p "GIM username [$gim_user]: " in; [[ -n "$in" ]] && gim_user="$in"
         read -rs -p "GIM password: " gim_pass; echo
       fi
-      echo ""
       read -r -p "Proceed with automated GIM S-TAP install? [Y/n]: " confirm
       if [[ "${confirm,,}" == "n" || "${confirm,,}" == "no" ]]; then
-        log "Automated GIM install declined. Printing manual GIM one-liner commands..."
-        "$(venv_python)" -m guardapi.stap manual \
-          --method gim \
-          --host "<DB_SERVER_IP>" \
-          --guardium-ip "$col_ip" \
-          --gim-url "$gim_url" \
-          --gim-user "$gim_user"
+        "$(venv_python)" -m guardapi.stap manual --method gim \
+          --host "<DB_SERVER_IP>" --guardium-ip "$col_ip" \
+          --gim-url "$gim_url" --gim-user "$gim_user"
         return 0
       fi
       ansible-playbook "$PROJECT_ROOT/ansible/playbooks/install-stap-gim.yml" \
@@ -467,32 +479,114 @@ install_stap() {
       ;;
 
     4|manual)
-      local sub_method
+      local sub_method db_host
       read -r -p "Manual for which method? [ssh/winrm/gim]: " sub_method
-      local db_host
       read -r -p "Target DB server IP/hostname: " db_host
       "$(venv_python)" -m guardapi.stap manual \
-        --method "$sub_method" \
-        --host "$db_host" \
-        --guardium-ip "$col_ip"
+        --method "$sub_method" --host "$db_host" --guardium-ip "$col_ip"
       ;;
 
-    *)
-      error "Invalid selection '$method'"
-      return 1
-      ;;
+    *) error "Invalid selection '$method'" ; return 1 ;;
   esac
 }
 
-# ── Validate / Status / Destroy ───────────────────────────────────────────────
-validate() {
-  validate_host || return 1
-  require_command virsh || return 1
-  virsh list --all
-  log "Infrastructure validated. Appliance validation requires live Guardium access."
+# ── deploy-gi (Guardium Insights on OCP/K8s) ─────────────────────────────────
+deploy_gi() {
+  log "Deploying IBM Guardium Insights (GI)"
+  require_command ansible-playbook || return 1
+  require_command helm             || { error "helm is required for GI deployment. Install: https://helm.sh/docs/intro/install/"; return 1; }
+  require_command kubectl          || { error "kubectl is required for GI deployment"; return 1; }
+
+  [[ -n "${IBM_ENTITLEMENT_KEY:-}" ]] || {
+    if [[ -t 0 ]]; then
+      read -rs -p "IBM Entitlement Key (from myibm.ibm.com): " IBM_ENTITLEMENT_KEY; echo
+      export IBM_ENTITLEMENT_KEY
+    else
+      error "Set IBM_ENTITLEMENT_KEY env var (from https://myibm.ibm.com/products-services/containerlibrary)"
+      return 1
+    fi
+  }
+
+  local gi_ns gi_ver gi_sc gi_admin_pass gi_db2_pass
+  gi_ns="${GI_NAMESPACE:-guardium-insights}"
+  gi_ver="${GI_VERSION:-3.3.0}"
+  gi_sc="${GI_STORAGE_CLASS:-}"
+
+  if [[ -t 0 ]]; then
+    read -r -p "GI Namespace [$gi_ns]: " in; [[ -n "$in" ]] && gi_ns="$in"
+    read -r -p "GI Version [$gi_ver]: " in;  [[ -n "$in" ]] && gi_ver="$in"
+    if [[ -z "$gi_sc" ]]; then
+      echo "Available StorageClasses:"; kubectl get sc --no-headers 2>/dev/null | awk '{print "  " $1}'
+      read -r -p "StorageClass name: " gi_sc
+    fi
+    read -rs -p "GI admin password: " gi_admin_pass; echo
+    read -rs -p "Db2 password: "      gi_db2_pass;   echo
+  else
+    gi_sc="${GI_STORAGE_CLASS:-ocs-storagecluster-ceph-rbd}"
+    gi_admin_pass="${GI_ADMIN_PASSWORD:-}"
+    gi_db2_pass="${GI_DB2_PASSWORD:-}"
+    [[ -n "$gi_admin_pass" && -n "$gi_db2_pass" ]] || {
+      error "Set GI_ADMIN_PASSWORD and GI_DB2_PASSWORD for non-interactive GI deploy"; return 1
+    }
+  fi
+
+  ansible-playbook "$PROJECT_ROOT/ansible/playbooks/deploy-gi.yml" \
+    --extra-vars "gi_namespace=$gi_ns" \
+    --extra-vars "gi_version=$gi_ver" \
+    --extra-vars "gi_storage_class=$gi_sc" \
+    --extra-vars "gi_admin_password=$gi_admin_pass" \
+    --extra-vars "gi_db2_password=$gi_db2_pass" \
+    --extra-vars "gi_license_accept=true" || return 1
+
+  state_set gi.deployed true
+  state_set gi.namespace "$gi_ns"
+  log "Guardium Insights deployed in namespace: $gi_ns"
 }
 
-status() { cat "$STATE_FILE"; }
+# ── full-lifecycle (all-in-one) ───────────────────────────────────────────────
+full_lifecycle() {
+  log "=== Starting Full Guardium Lifecycle Deployment ==="
+  log "Steps: provision -> converge -> register -> policies -> stap"
+  echo ""
+  echo "This will run the COMPLETE lifecycle:"
+  echo "  1. Provision collector + aggregator VMs"
+  echo "  2. Converge (wait for network + configure)"
+  echo "  3. Register collector to aggregator"
+  echo "  4. Deploy sample policies"
+  echo "  5. Install S-TAP agents"
+  echo ""
+  read -r -p "Continue? [Y/n]: " confirm
+  [[ "${confirm,,}" == "n" || "${confirm,,}" == "no" ]] && { log "Aborted"; return 0; }
+
+  provision full     || { error "Provision step failed"; return 1; }
+  log "Waiting 60s for VMs to initialise..."; sleep 60
+  converge collector || { error "Converge collector failed"; return 1; }
+  converge aggregator || { error "Converge aggregator failed"; return 1; }
+  register            || { error "Registration failed"; return 1; }
+  policies            || { error "Policy deployment failed"; return 1; }
+  install_stap        || { error "S-TAP install failed"; return 1; }
+  health_check        || log "WARN: Health-check found issues after deployment"
+
+  state_set lifecycle.complete true
+  log "=== Full Lifecycle Deployment Complete ==="
+  log "Run 'health' to confirm all appliances are healthy."
+}
+
+# ── validate / status / destroy ───────────────────────────────────────────────
+validate() {
+  validate_host || return 1
+  command -v virsh >/dev/null 2>&1 && virsh list --all || true
+  log "Infrastructure validated."
+}
+
+status() {
+  echo ""
+  echo "=== Deployment State ==="
+  cat "$STATE_FILE"
+  echo ""
+  echo "=== Log tail ==="
+  tail -20 "$DEPLOY_LOG"
+}
 
 destroy() {
   [[ "${GUARDIUM_ALLOW_DESTROY:-}" == yes ]] || {
@@ -510,28 +604,35 @@ destroy() {
 interactive_menu() {
   echo ""
   echo "╔══════════════════════════════════════════════════════════════════════╗"
-  echo "║          IBM Guardium Deployment Automation — Full Lifecycle         ║"
+  echo "║        IBM Guardium Deployment Automation — Full Lifecycle           ║"
   echo "╠══════════════════════════════════════════════════════════════════════╣"
-  echo "║  INFRASTRUCTURE                                                      ║"
-  echo "║   1. Deploy Collector                                                ║"
-  echo "║   2. Deploy Aggregator                                               ║"
+  echo "║  INFRASTRUCTURE  (on-prem KVM / vCenter / AWS / GCP / Azure)         ║"
+  echo "║   1. Deploy Collector VM                                             ║"
+  echo "║   2. Deploy Aggregator VM                                            ║"
   echo "║   3. Deploy Both (full)                                              ║"
   echo "║   4. Converge Collector  (post-install network/config)               ║"
   echo "║   5. Converge Aggregator                                             ║"
   echo "╠══════════════════════════════════════════════════════════════════════╣"
   echo "║  INTEGRATION                                                         ║"
-  echo "║   6. Register Collector → Aggregator                                 ║"
-  echo "║   7. Deploy Sample Policies (Baseline, PCI-DSS, HIPAA, Extrusion)    ║"
+  echo "║   6. Register Collector -> Aggregator (single)                       ║"
+  echo "║   7. Register Multiple Collectors -> Aggregator (batch)              ║"
+  echo "║   8. Deploy Sample Policies (Baseline/PCI/HIPAA/GDPR/SOX/CIS)        ║"
   echo "╠══════════════════════════════════════════════════════════════════════╣"
-  echo "║  S-TAP / GIM AGENT DEPLOYMENT                                       ║"
-  echo "║   8. Install S-TAP (SSH / WinRM / GIM — prompts for method)          ║"
-  echo "║   9. Print Manual One-liner Commands Only (no automation)            ║"
+  echo "║  S-TAP / GIM AGENT DEPLOYMENT                                        ║"
+  echo "║   9. Install S-TAP (SSH / WinRM / GIM — prompts for method)          ║"
+  echo "║  10. Print Manual One-liner Commands Only (no automation)            ║"
+  echo "╠══════════════════════════════════════════════════════════════════════╣"
+  echo "║  GUARDIUM INSIGHTS (GI)                                              ║"
+  echo "║  11. Deploy Guardium Insights on OpenShift / Kubernetes              ║"
   echo "╠══════════════════════════════════════════════════════════════════════╣"
   echo "║  OPERATIONS                                                          ║"
-  echo "║  10. Validate Infrastructure                                         ║"
-  echo "║  11. Show Deployment State                                           ║"
-  echo "║  12. Destroy Lab Environment                                         ║"
-  echo "║  13. Exit                                                            ║"
+  echo "║  12. Health Check (all appliances)                                   ║"
+  echo "║  13. Full Lifecycle (provision -> converge -> register -> policies   ║"
+  echo "║       -> stap)  ALL-IN-ONE                                           ║"
+  echo "║  14. Validate Infrastructure                                         ║"
+  echo "║  15. Show Deployment State + Log Tail                                ║"
+  echo "║  16. Destroy Lab Environment                                         ║"
+  echo "║  17. Exit                                                            ║"
   echo "╚══════════════════════════════════════════════════════════════════════╝"
   echo ""
   read -r -p "Select option: " opt
@@ -542,36 +643,44 @@ interactive_menu() {
     4)  converge collector     ;;
     5)  converge aggregator    ;;
     6)  register               ;;
-    7)  policies               ;;
-    8)  install_stap           ;;
-    9)
+    7)  register_multi         ;;
+    8)  policies               ;;
+    9)  install_stap           ;;
+    10)
       local sm db_ip col_ip; col_ip="$(config_value collector.ip)"
       read -r -p "Method [ssh/winrm/gim]: " sm
       read -r -p "Target DB host: " db_ip
       "$(venv_python)" -m guardapi.stap manual \
         --method "$sm" --host "$db_ip" --guardium-ip "$col_ip"
       ;;
-    10) validate               ;;
-    11) status                 ;;
-    12) destroy                ;;
-    13) return 0               ;;
+    11) deploy_gi              ;;
+    12) health_check           ;;
+    13) full_lifecycle         ;;
+    14) validate               ;;
+    15) status                 ;;
+    16) destroy                ;;
+    17) return 0               ;;
     *)  error "Invalid selection" ;;
   esac
 }
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 case "${1:-menu}" in
-  collector|aggregator|full)  provision "$1"      ;;
-  converge)                   converge "${2:-}"   ;;
-  register)                   register            ;;
-  policies)                   policies            ;;
-  stap|install-stap)          install_stap        ;;
-  validate)                   validate            ;;
-  status)                     status              ;;
-  destroy)                    destroy             ;;
-  menu)                       interactive_menu    ;;
+  collector|aggregator|full)  provision "$1"            ;;
+  converge)                   converge "${2:-}"          ;;
+  register)                   register                   ;;
+  register-multi)             register_multi             ;;
+  policies)                   policies                   ;;
+  stap|install-stap)          install_stap               ;;
+  gi|deploy-gi)               deploy_gi                  ;;
+  health|health-check)        health_check               ;;
+  lifecycle|full-lifecycle)   full_lifecycle             ;;
+  validate)                   validate                   ;;
+  status)                     status                     ;;
+  destroy)                    destroy                    ;;
+  menu)                       interactive_menu           ;;
   *)
-    printf 'Usage: %s {collector|aggregator|full|converge <role>|register|policies|stap|validate|status|destroy|menu}\n' "$0" >&2
+    printf 'Usage: %s {collector|aggregator|full|converge <role>|register|register-multi|policies|stap|gi|health|lifecycle|validate|status|destroy|menu}\n' "$0" >&2
     exit 2
     ;;
 esac

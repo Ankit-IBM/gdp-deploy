@@ -1,0 +1,132 @@
+---
+# Deploy Guardium Insights (GI) on Red Hat OpenShift / Kubernetes.
+#
+# Prerequisites:
+#   - OCP 4.10+ or Kubernetes 1.24+ cluster accessible via kubectl/oc
+#   - IBM Entitlement Key in env: IBM_ENTITLEMENT_KEY
+#   - StorageClass that supports ReadWriteOnce (e.g. ocs-storagecluster-ceph-rbd)
+#   - Sufficient cluster capacity: 32 vCPU / 128 GB RAM minimum
+#
+# Required --extra-vars:
+#   gi_namespace, gi_version, gi_storage_class
+#   gi_db2_password, gi_admin_password
+#   gi_license_accept: "true"
+#
+# Optional:
+#   gi_registry       (default: icr.io/ibm-guardium-insights)
+#   gi_helm_repo      (default: https://raw.githubusercontent.com/IBM/charts/master/repo/ibm-helm)
+#   gi_db2_storage_gb (default: 300)
+#   kubeconfig_path   (default: ~/.kube/config)
+
+- name: Deploy IBM Guardium Insights on OpenShift/Kubernetes
+  hosts: localhost
+  gather_facts: false
+  vars:
+    gi_namespace:      "guardium-insights"
+    gi_version:        "3.3.0"
+    gi_registry:       "icr.io/ibm-guardium-insights"
+    gi_helm_repo:      "https://raw.githubusercontent.com/IBM/charts/master/repo/ibm-helm"
+    gi_storage_class:  "ocs-storagecluster-ceph-rbd"
+    gi_db2_storage_gb: 300
+    gi_license_accept: "false"
+    kubeconfig_path:   "{{ lookup('env','HOME') }}/.kube/config"
+
+  tasks:
+    - name: Validate license acceptance
+      ansible.builtin.fail:
+        msg: "You must set gi_license_accept=true to accept the IBM Guardium Insights license"
+      when: gi_license_accept != "true"
+
+    - name: Validate IBM Entitlement Key
+      ansible.builtin.fail:
+        msg: "IBM_ENTITLEMENT_KEY environment variable must be set"
+      when: lookup('env','IBM_ENTITLEMENT_KEY') == ""
+
+    - name: Create GI namespace
+      ansible.builtin.command:
+        cmd: kubectl create namespace {{ gi_namespace }} --dry-run=client -o yaml | kubectl apply -f -
+      environment:
+        KUBECONFIG: "{{ kubeconfig_path }}"
+      changed_when: true
+
+    - name: Create IBM Entitlement Key secret
+      ansible.builtin.command:
+        cmd: >
+          kubectl create secret docker-registry ibm-entitlement-key
+          --docker-server=cp.icr.io
+          --docker-username=cp
+          --docker-password={{ lookup('env','IBM_ENTITLEMENT_KEY') }}
+          --namespace={{ gi_namespace }}
+          --dry-run=client -o yaml | kubectl apply -f -
+      environment:
+        KUBECONFIG: "{{ kubeconfig_path }}"
+      changed_when: true
+
+    - name: Add IBM Helm repository
+      ansible.builtin.command:
+        cmd: helm repo add ibm-helm {{ gi_helm_repo }}
+      changed_when: false
+      failed_when: false
+
+    - name: Update Helm repositories
+      ansible.builtin.command:
+        cmd: helm repo update
+      changed_when: false
+
+    - name: Deploy Guardium Insights via Helm
+      ansible.builtin.command:
+        cmd: >
+          helm upgrade --install guardium-insights ibm-helm/ibm-guardium-insights
+          --namespace {{ gi_namespace }}
+          --version {{ gi_version }}
+          --set global.licenseAccept={{ gi_license_accept }}
+          --set global.image.registry={{ gi_registry }}
+          --set global.storageClass={{ gi_storage_class }}
+          --set db2u.storage.storageClassName={{ gi_storage_class }}
+          --set db2u.storage.size={{ gi_db2_storage_gb }}Gi
+          --set guardiumInsights.admin.password={{ gi_admin_password }}
+          --set db2u.db2inst.password={{ gi_db2_password }}
+          --timeout 45m
+          --wait
+      environment:
+        KUBECONFIG: "{{ kubeconfig_path }}"
+      register: gi_deploy
+      changed_when: true
+
+    - name: Show GI deployment result
+      ansible.builtin.debug:
+        msg: "{{ gi_deploy.stdout_lines }}"
+
+    - name: Wait for GI pods to become ready
+      ansible.builtin.command:
+        cmd: >
+          kubectl wait pod
+          --for=condition=Ready
+          --selector=app.kubernetes.io/instance=guardium-insights
+          --namespace={{ gi_namespace }}
+          --timeout=1800s
+      environment:
+        KUBECONFIG: "{{ kubeconfig_path }}"
+      register: gi_pods
+      changed_when: false
+
+    - name: Get GI route / ingress URL
+      ansible.builtin.command:
+        cmd: >
+          kubectl get route -n {{ gi_namespace }} -o jsonpath='{.items[0].spec.host}' 2>/dev/null ||
+          kubectl get ingress -n {{ gi_namespace }} -o jsonpath='{.items[0].spec.rules[0].host}' 2>/dev/null
+      environment:
+        KUBECONFIG: "{{ kubeconfig_path }}"
+      register: gi_url
+      changed_when: false
+      failed_when: false
+
+    - name: Print GI access URL
+      ansible.builtin.debug:
+        msg:
+          - "Guardium Insights deployed successfully!"
+          - "URL: https://{{ gi_url.stdout }}"
+          - "Admin credentials set via gi_admin_password"
+          - ""
+          - "Post-install: connect GI to your Guardium Collectors via"
+          - "  GI UI -> Data Sources -> Add Guardium Data Protection"

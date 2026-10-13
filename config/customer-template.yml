@@ -1,113 +1,176 @@
-# ── Customer deployment configuration template ────────────────────────────────
-# Copy to config/customer-<name>.yml and fill in values.
-# Credentials: use environment variables — never put passwords in this file.
+## IBM Guardium Deployment — Customer Environment Config Template
+## Copy to config/<customer>.yml and fill in all values.
+## Never commit passwords — use environment variables for credentials.
 
 project:
-  name: customer-guardium
+  name: guardium-customer          # Descriptive name for this deployment
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Guardium version
+# ──────────────────────────────────────────────────────────────────────────────
 guardium:
   version: "12.2"
-  iso_path: ""                    # for KVM/vSphere OVA local path only
-  install_timeout_minutes: 90
+  iso_path: ""                     # KVM only — absolute path to .iso on the hypervisor
+  install_timeout_minutes: 45
 
-# ── Cloud / hypervisor target ─────────────────────────────────────────────────
-# Values: kvm | vsphere | gcp | aws | azure
+# ──────────────────────────────────────────────────────────────────────────────
+# Cloud / hypervisor provider
+# Valid: kvm | vsphere | aws | gcp | azure
+# ──────────────────────────────────────────────────────────────────────────────
 cloud:
-  provider: kvm
+  provider: vsphere                # Change to: kvm | vsphere | aws | gcp | azure
 
-# ── On-prem KVM (lab) ─────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
+# On-prem KVM (libvirt)
+# ──────────────────────────────────────────────────────────────────────────────
 kvm:
   storage_pool: default
-network:
-  type: ovs
-  ovs_bridge: ""
+  network:
+    type: ovs                      # ovs | bridge
+    ovs_bridge: ovs-br0
 
-# ── VMware vSphere / vCenter ──────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
+# VMware vSphere / vCenter (on-prem)
+# Credentials via env: VSPHERE_USER, VSPHERE_PASSWORD
+# ──────────────────────────────────────────────────────────────────────────────
 vsphere:
-  server: ""              # vCenter FQDN or IP
-  datacenter: ""
-  cluster: ""
-  datastore: ""
-  network: ""             # Port group name
-  content_library: ""     # Content library name
-  content_library_item: "" # OVA/OVF item name
-  vm_folder: "guardium"
-  # Auth via env: VSPHERE_USER, VSPHERE_PASSWORD
+  server: "vcenter.example.com"
+  datacenter: "DC1"
+  cluster: "Cluster1"
+  datastore: "datastore1"
+  network: "VM Network"
+  vm_folder: "Guardium"
+  # Upload ISO to the datastore first, then set the path:
+  # iso_datastore_path is set interactively by list-images.py at deploy time
 
-# ── GCP ───────────────────────────────────────────────────────────────────────
-gcp:
-  project_id: ""
-  region: ""
-  zone: ""
-  subnetwork: ""
-  guardium_image: ""       # custom image built from Guardium ISO
-  machine_type: "n2-standard-8"
-  # Auth via GOOGLE_APPLICATION_CREDENTIALS or gcloud ADC
-
-# ── AWS ───────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
+# Amazon Web Services
+# Credentials via env: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
+# ──────────────────────────────────────────────────────────────────────────────
 aws:
   region: "us-east-1"
-  guardium_ami_id: ""      # AMI imported via VM Import/Export
-  instance_type: "m5.2xlarge"
-  subnet_id: ""
-  security_group_ids: []
-  # Auth via AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY or instance role
+  instance_type: "m5.4xlarge"      # 16 vCPU / 64 GB — minimum for Guardium 12.x
+  subnet_id: "subnet-XXXXXXXXX"
+  # AMI is selected interactively at deploy time via list-images.py
+  # key_pair_name is read from env AWS_KEY_PAIR_NAME
 
-# ── Azure ─────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
+# Google Cloud Platform
+# Credentials via env: GOOGLE_APPLICATION_CREDENTIALS or gcloud auth
+# ──────────────────────────────────────────────────────────────────────────────
+gcp:
+  project_id: "my-gcp-project"
+  region: "us-central1"
+  zone: "us-central1-a"
+  machine_type: "n2-standard-16"   # 16 vCPU / 64 GB
+  subnetwork: "default"
+  # Image is selected interactively at deploy time via list-images.py
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Microsoft Azure
+# Credentials via env: ARM_CLIENT_ID, ARM_CLIENT_SECRET, ARM_TENANT_ID, ARM_SUBSCRIPTION_ID
+# ──────────────────────────────────────────────────────────────────────────────
 azure:
-  subscription_id: ""
-  resource_group: ""
-  location: ""             # e.g. eastus
-  vm_size: "Standard_D8s_v5"
-  guardium_image_id: ""    # managed image resource ID
-  subnet_id: ""
-  admin_ssh_public_key: "" # placeholder required by Azure; not used by Guardium
-  # Auth via ARM_CLIENT_ID, ARM_CLIENT_SECRET, ARM_TENANT_ID
+  subscription_id: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+  resource_group: "guardium-rg"
+  location: "eastus"
+  vm_size: "Standard_D16s_v3"      # 16 vCPU / 64 GB
+  subnet_id: "/subscriptions/.../resourceGroups/.../subnets/guardium-subnet"
+  admin_ssh_public_key: ""         # paste or set AZURE_ADMIN_SSH_PUBLIC_KEY env var
+  # Image is selected interactively at deploy time via list-images.py
 
-# ── Appliance definitions ─────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
+# Collector appliance
+# ──────────────────────────────────────────────────────────────────────────────
 collector:
   enabled: true
-  hostname: gdp-col01.example.invalid
-  ip: 192.0.2.31
-  cpu: 4
-  memory_gb: 16
-  disk_gb: 300
+  hostname: gdp-col01
+  ip: 10.50.20.31                  # Static IP within your network
+  cpu: 8
+  memory_gb: 32
+  disk_gb: 500
+  # Credentials via env: GUARDIUM_COLLECTOR_USERNAME, GUARDIUM_COLLECTOR_PASSWORD
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Aggregator appliance
+# ──────────────────────────────────────────────────────────────────────────────
 aggregator:
   enabled: true
-  hostname: gdp-agg01.example.invalid
-  ip: 192.0.2.21
-  cpu: 4
-  memory_gb: 16
-  disk_gb: 300
+  hostname: gdp-agg01
+  ip: 10.50.20.21
+  cpu: 8
+  memory_gb: 32
+  disk_gb: 500
+  # Credentials via env: GUARDIUM_AGGREGATOR_USERNAME, GUARDIUM_AGGREGATOR_PASSWORD
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Central Manager (optional — enterprise deployments only)
+# ──────────────────────────────────────────────────────────────────────────────
 central_manager:
   enabled: false
-  hostname: gdp-cm01.example.invalid
-  ip: 192.0.2.20
-  cpu: 4
-  memory_gb: 16
-  disk_gb: 300
+  hostname: gdp-cm01
+  ip: 10.50.10.20
+  cpu: 8
+  memory_gb: 32
+  disk_gb: 500
 
-# ── GIM (Guardium Installation Manager) ───────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
+# Guardium Insights (GI) — on Red Hat OpenShift or Kubernetes
+# Credentials via env: IBM_ENTITLEMENT_KEY, GI_ADMIN_PASSWORD, GI_DB2_PASSWORD
+# ──────────────────────────────────────────────────────────────────────────────
+gi:
+  enabled: false
+  namespace: "guardium-insights"
+  version: "3.3.0"
+  storage_class: "ocs-storagecluster-ceph-rbd"
+  db2_storage_gb: 300
+  # kubeconfig_path defaults to ~/.kube/config
+
+# ──────────────────────────────────────────────────────────────────────────────
+# GIM — Guardium Installation Manager
+# Used for enterprise-scale S-TAP deployment
+# Credentials via env: GIM_USERNAME, GIM_PASSWORD
+# ──────────────────────────────────────────────────────────────────────────────
 gim:
-  server_url: ""            # https://<collector-or-dedicated-host>:8082
-  # Auth via env: GIM_USERNAME, GIM_PASSWORD
+  enabled: true
+  server_url: ""                   # defaults to https://<collector_ip>:8082
 
-# ── S-TAP target DB servers ───────────────────────────────────────────────────
-# Populate ansible/inventory/hosts.yml with actual DB server IPs.
-agents:
-  gim: false
-  stap: false
-  stap_method: gim          # gim | ssh | winrm
-  guardium_version: "12.2"
+# ──────────────────────────────────────────────────────────────────────────────
+# S-TAP targets (for Ansible inventory)
+# Add DB servers that need S-TAP installed
+# ──────────────────────────────────────────────────────────────────────────────
+stap_targets:
+  linux:
+    - host: "10.1.2.10"
+      db_type: "oracle"
+      ssh_user: "root"
+      # ssh_key_path: ~/.ssh/id_rsa
+    - host: "10.1.2.11"
+      db_type: "db2"
+      ssh_user: "root"
+  windows:
+    - host: "10.1.2.20"
+      db_type: "mssql"
+      winrm_user: "Administrator"
+      # winrm_password from env: WINRM_PASSWORD_10_1_2_20
 
-# ── Credentials (environment variable references — never literal values) ──────
-credentials:
-  source: environment
-  collector_username: "${GUARDIUM_COLLECTOR_USERNAME}"
-  collector_password: "${GUARDIUM_COLLECTOR_PASSWORD}"
-  aggregator_username: "${GUARDIUM_AGGREGATOR_USERNAME}"
-  aggregator_password: "${GUARDIUM_AGGREGATOR_PASSWORD}"
-  gim_username: "${GIM_USERNAME}"
-  gim_password: "${GIM_PASSWORD}"
+# ──────────────────────────────────────────────────────────────────────────────
+# Network
+# ──────────────────────────────────────────────────────────────────────────────
+network:
+  type: ovs
+  ovs_bridge: ovs-br0
+  dns_servers:
+    - 8.8.8.8
+    - 8.8.4.4
+  ntp_servers:
+    - pool.ntp.org
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Policy deployment defaults
+# ──────────────────────────────────────────────────────────────────────────────
+policies:
+  default_set: standard            # standard | extended | all
+  # standard  = BASELINE_AUDIT, PCI_DSS_AUDIT, HIPAA_AUDIT, EXTRUSION_DETECT
+  # extended  = above + GDPR_PII_AUDIT, SOX_FINANCIAL_AUDIT, CIS_HARDENING_AUDIT
+  # all       = same as extended

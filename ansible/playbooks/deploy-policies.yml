@@ -1,26 +1,40 @@
 ---
-# Deploy Guardium sample security policies to a Collector.
-# Required --extra-vars: collector_url, collector_username, collector_password
+# Deploy sample Guardium policies via REST API.
+# policy_set: standard | extended | all  (default: standard)
+#
+# Required --extra-vars:
+#   collector_url, collector_username, collector_password
+# Optional:
+#   policy_set   (default: standard)
 
-- name: Deploy Guardium sample policies
+- name: Deploy Sample Guardium Policies
   hosts: localhost
   gather_facts: false
   vars:
-    install_policies: true
-    verify_tls: false
+    policy_set: "standard"
+
   tasks:
-    - name: Deploy policies via guardapi.policies
+    - name: Deploy policies (set={{ policy_set }})
       ansible.builtin.command:
         cmd: >
-          {{ playbook_dir }}/../../.venv/bin/python3 -m guardapi.policies
-          --url {{ collector_url }}
-          --username {{ collector_username }}
-          --password {{ collector_password }}
-          {{ '--no-install' if not (install_policies | bool) else '' }}
-          {{ '--no-verify-tls' if not (verify_tls | bool) else '' }}
-      register: pol_out
-      changed_when: "'Deployed' in pol_out.stdout"
+          {{ playbook_dir }}/../../.venv/bin/python3 -c "
+          import sys, logging
+          logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
+          sys.path.insert(0, '{{ playbook_dir }}/../..')
+          from guardapi.policies import deploy_sample_policies
+          deployed = deploy_sample_policies(
+              collector_url='{{ collector_url }}',
+              username='{{ collector_username }}',
+              password='{{ collector_password }}',
+              verify_tls=False,
+              install=True,
+              policy_set='{{ policy_set }}',
+          )
+          print(f'DEPLOYED {len(deployed)} policies: ' + ', '.join(deployed))
+          "
+      register: policy_out
+      changed_when: "'DEPLOYED' in policy_out.stdout"
 
-    - name: Show result
+    - name: Show policy result
       ansible.builtin.debug:
-        msg: "{{ pol_out.stdout_lines }}"
+        msg: "{{ policy_out.stdout_lines }}"
