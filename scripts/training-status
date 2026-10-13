@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# training-status [k8s|ibm|coding|all]
+TOPIC="${1:-all}"
+DC="docker compose -f /root/rsh-agent/compose.yaml exec training-worker"
+
+check() {
+  local name="$1"
+  local progress="/app/training-data/${name}-progress.json"
+  local report="/app/training-data/${name}-adapter/trial_report.json"
+  echo ""
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo " Topic  : ${name}"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  if ps aux | grep train_adapter | grep "${name}" | grep -qv grep; then
+    echo " Status : RUNNING"
+    $DC python3 /tmp/show_progress.py "${progress}" 2>/dev/null || echo " Progress: model loading..."
+  elif $DC test -f "${report}" 2>/dev/null; then
+    echo " Status : COMPLETE"
+    $DC python3 /tmp/show_report.py "${report}" 2>/dev/null
+  else
+    echo " Status : NOT STARTED"
+  fi
+}
+
+case "$TOPIC" in
+  k8s)    check "k8s-ocp-ansible" ;;
+  ibm)    check "ibm-security" ;;
+  coding) check "coding" ;;
+  all)
+    check "ibm-security"
+    check "k8s-ocp-ansible"
+    check "coding"
+    ;;
+  *) echo "Usage: training-status [k8s|ibm|coding|all]"; exit 1 ;;
+esac
+echo ""
